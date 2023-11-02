@@ -13,8 +13,8 @@ from instrument import Instrument
 from util import BatchedFilesDataset, load_batch, cubic_transform
 
 class Synthetic(Instrument):
-    _wave_obs = torch.arange(5000,5050,0.025, dtype=torch.double)
-    wave_rest = torch.linspace(4999.0, 5051.,2100, dtype=torch.double)
+    _wave_obs = torch.arange(5372.52,5476.09,0.01, dtype=torch.double)
+    wave_rest = torch.arange(5372.51, 5476.10,0.01, dtype=torch.double)
     c = 299792458. # m/s
 
     def __init__(self, lsf=None, calibration=None):
@@ -73,7 +73,7 @@ class Synthetic(Instrument):
             cls.save_batch(dir, batch, select, tag=tag, counter=counter)
 
     @classmethod
-    def augment_spectra(cls,batch,z,noise=True,ratio=0.20):
+    def augment_spectra(cls,batch,noise=True,ratio=0.20):
         spec, w, _, ID = batch[:4]
         batch_size, spec_size = spec.shape
         device = spec.device
@@ -87,18 +87,21 @@ class Synthetic(Instrument):
 
         # redshift interpolation
         spec_new = cubic_transform(wave_obs, spec, wave_redshifted)
+        w_new = cubic_transform(wave_obs, w, wave_redshifted)
+
         if noise:
-            spec_noise = torch.normal(mean=0,std=w[0]**(-0.5),
-                                      size=spec.shape,device=device)
+            sigma = (w_new.mean(dim=-1)**(-0.5))[:,None]
+            spec_noise = sigma*torch.normal(mean=0,std=1.0,size=spec.shape,
+                                            device=device)
             noise_mask = torch.rand(spec.shape).to(device)>ratio
             spec_noise[noise_mask]=0
             spec_new += spec_noise
+            w_new = 1 / (1 / (w_new) + spec_noise**2)
         if spec.dtype==torch.float32:spec_new=spec_new.float()
         # ensure extrapolated values have zero weights
         wmin = wave_obs.min()
         wmax = wave_obs.max()
         out = (wave_redshifted<wmin)|(wave_redshifted>wmax)
         spec_new[out] = 1
-        w_new = torch.clone(w)
-        #acf = cls.acf_ccf(wave_obs,spec)
+        w_new[out] = 0
         return spec_new, w_new, _, z_offset

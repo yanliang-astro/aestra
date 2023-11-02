@@ -374,7 +374,7 @@ class SpectrumAutoencoder(BaseAutoencoder):
         )
 
         if rv_estimator==None:
-            rv_estimator = RVEstimator(instrument.wave_obs.shape[0],sizes = [10,10])
+            rv_estimator = RVEstimator(instrument.wave_obs.shape[0],sizes = [20,40])
             #rv_estimator = NullRVEstimator()
 
         super(SpectrumAutoencoder, self).__init__(
