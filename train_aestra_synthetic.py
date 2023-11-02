@@ -109,12 +109,12 @@ def consistency_loss(s, s_aug, individual=False, sigma_s=0.02):
         return cons_loss
     return cons_loss.sum()
 
-def z_offset_loss(z_off, z_off_true, sigma_z=1e-9,individual=False):
+def z_offset_loss(z_off, z_off_true, sigma_z=3.3e-9,individual=False):
     z_loss = ((z_off - z_off_true)/sigma_z)**2
     if individual:return z_loss
     return z_loss.sum()
 
-def restframe_weight(model,instrument,xrange=[5000.,5050.],sn=1000):
+def restframe_weight(model,instrument,xrange=[5372.52,5476.09],sn=300):
     x = model.decoder.wave_rest
     w = torch.zeros_like(x).float()
     w[(x>xrange[0])*(x<xrange[1])]=sn**2
@@ -125,7 +125,7 @@ def similarity_loss(x,slope=1.0,wid=5.0):
     return sim_loss
 
 def similarity_restframe(instrument, model, s=None, slope=1.0, sigma_s=0.02,
-                         individual=False, sn=1000):
+                         individual=False, sn=300):
     _, s_size = s.shape
     device = s.device
 
@@ -147,6 +147,8 @@ def similarity_restframe(instrument, model, s=None, slope=1.0, sigma_s=0.02,
     sim_loss[diag_mask] = 0
     if individual:
         return s_sim,spec_sim,sim_loss
+    print("sigma_s:",sigma_s)
+    print("s_sim:",s_sim,"spec_sim:",spec_sim)
     # total loss: sum over N^2 terms,
     # needs to have amplitude of N terms to compare to fidelity loss
     return sim_loss.sum() / batch_size
@@ -161,13 +163,13 @@ def _losses(model,
             fid=True,
             mi=False):
 
-    spec, w, acf, ID = batch
+    spec, w, _, ID = batch
 
     if template==None: template = 0
 
     if fid: s = model.encode(spec-template)
     else: s = 0.0
-    rv = model.estimate_rv(spec-template)
+    rv =  model.estimate_rv(spec-template)
     z = (rv)/instrument.c
 
     fid_loss = sim_loss = flex_loss = 0
@@ -175,12 +177,10 @@ def _losses(model,
     if fid:
         y_act, _, spectrum_observed = model._forward(spec, w, s, z)
         fid_loss = model._loss(spec, w, spectrum_observed)
-        flex_loss = slope*(y_act**2/0.01).sum()
-        #model.decoder.spec_rest += (y_act.min(dim=0)[0].detach())
-        #fid_loss = model.loss(spec, w, s, z)
+        flex_loss = slope*(y_act**2/1.0).sum()
 
     if similarity:
-        sim_loss = similarity_restframe(instrument, model, s, slope=slope,sigma_s=sigma_s,sn=(w.mean())**0.5)
+        sim_loss = similarity_restframe(instrument, model, s, slope=slope,sigma_s=sigma_s)
     if mi:flex_loss = mutual_information(s,rv)*spec.shape[0]
 
     return fid_loss, sim_loss, flex_loss, s, z
@@ -194,7 +194,7 @@ def get_losses(model,
                consistency=True,
                flexibility=True,
                slope=0,
-               sigma_s=0.25,
+               sigma_s=4,
                zloss=True,
                skipfid=False
                ):
@@ -203,8 +203,8 @@ def get_losses(model,
 
     loss,sim_loss,flex_loss,s,z = _losses(model, instrument, batch, similarity=similarity, slope=slope, sigma_s=sigma_s, fid=not skipfid,template=template)
 
-    if zloss or consistency or augfid:
-        batch_copy = aug_fct(batch,z)
+    if zloss or consistency:
+        batch_copy = aug_fct(batch)
         fid_loss,_,_,s_,z_ = _losses(model, instrument,batch_copy, template=template,fid=False,similarity=False)
         z_off = z_ - z
         z_off_true = batch_copy[3]
@@ -212,9 +212,10 @@ def get_losses(model,
 
     if zloss:
         z_loss = z_offset_loss(z_off, z_off_true)
-        #zeropoint_loss = ((z*instrument.c/1.0)**2).sum()
+        print("z_loss:",z_loss.item(),
+              "RV: %.2f, %.2f"%(Synthetic.c*z.min(),
+                                Synthetic.c*z.max()))
     else: z_loss = 0
-    print("z_loss:",z_loss)
 
     if consistency and aug_fct is not None:
         cons_loss = consistency_loss(s, s_, sigma_s=sigma_s)
@@ -497,8 +498,8 @@ if __name__ == "__main__":
             "decoder":True,"spec_rest":True}
     train_sequence = prepare_train([FULL],niter=args.iteration)
 
-    annealing_step = 1000
-    ANNEAL_SCHEDULE = np.linspace(0.0,1.0,annealing_step)
+    annealing_step = 100
+    ANNEAL_SCHEDULE = np.linspace(0.0,2.0,annealing_step)
     if args.verbose and args.similarity:
         print("similarity_slope:",len(ANNEAL_SCHEDULE),ANNEAL_SCHEDULE)
 
