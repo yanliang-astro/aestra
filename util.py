@@ -121,7 +121,8 @@ def density_plot(points,bins=30):
     mesh_dict = {"XY":[X,Y,density]}
     return mesh_dict
 
-def visualize_encoding(points,points_aug,RV_encode,radius=0,tag=None):
+def visualize_encoding(points,points_aug,v_target,v_name,
+                       radius=0,tag=None):
 
     axis_mean = points.mean(axis=1,keepdims=True)
     axis_std = points.std(axis=1,keepdims=True)
@@ -152,7 +153,7 @@ def visualize_encoding(points,points_aug,RV_encode,radius=0,tag=None):
 
     import matplotlib.colors
 
-    elev=20;azim=150; dtr = np.pi/180.0
+    elev=20;azim=130; dtr = np.pi/180.0
     viewpoint = np.array([np.cos(elev*dtr)*np.cos(azim*dtr),
                           np.cos(elev*dtr)*np.sin(azim*dtr),
                           np.sin(elev*dtr)])
@@ -163,37 +164,33 @@ def visualize_encoding(points,points_aug,RV_encode,radius=0,tag=None):
     depth /= depth.min()
     size = 40/depth**2+5
     #colors = points[0] 
-    colors = RV_encode
+    colors = v_target
+    vmin,vmax=np.quantile(v_target,[0.05,0.95])
     print("colors:",colors.min(),colors.max())
-    print("RV_encode:",RV_encode.min(),RV_encode.max())
+    print("v_target:",v_target.min(),v_target.max())
     #print("depth:",depth.shape)
     #print(size.min(),size.mean(),size.max())
     # 3D rendering
 
-    b_cmap = matplotlib.colors.LinearSegmentedColormap.from_list("", ["b","skyblue"])
-    r_cmap = matplotlib.colors.LinearSegmentedColormap.from_list("", ["r","salmon"])
 
     fig = plt.figure(figsize = (10, 8))
     ax = plt.axes(projection ="3d")
     # Add x, y gridlines
-    #ax.grid(b = True, color ='grey',linestyle ='-.', linewidth = 0.3,alpha = 0.2)
     pic = ax.scatter(points[0], points[1], points[2], s=size, marker="o",
-                     alpha=1,c=colors,cmap="viridis")
-    #ax.scatter(points_aug[0], points_aug[1], points_aug[2], s=size, marker="o",alpha=1,c=colors,cmap=r_cmap)
-    #for i in range(N):plt.plot([points[0,i],points_aug[0,i]],[points[1,i],points_aug[1,i]],[points[2,i],points_aug[2,i]],c="grey",lw=0.5)
+                     alpha=1,c=colors,cmap="viridis",vmin=vmin,vmax=vmax)
 
-    xlim=(-4, 5)
-    ylim=(-3, 5)
-    zlim=(-4, 7)
+    xlim=(-3, 3)
+    ylim=(-3, 3)
+    zlim=(-3, 5)
 
     ms=5;c="darkgrey"
     ax.scatter(points[0], points[1],[zlim[0]]*N,s=ms,c=c,alpha=1)
     ax.scatter(points_aug[0], points_aug[1],[zlim[0]]*N,
                s=ms,c=c,alpha=1)
     ms=5;c="grey"
-    ax.scatter(points[0],[ylim[0]]*N, points[2],s=ms,c=c,alpha=1)
+    ax.scatter(points[0],[ylim[0]]*N, points[2],s=ms,c=c,alpha=1,zorder=-10)
     ax.scatter(points_aug[0],[ylim[0]]*N, points_aug[2],
-               s=ms,c=c,alpha=1)
+               s=ms,c=c,alpha=1,zorder=-10)
 
     pos = [0,4,0]
     fs = 20
@@ -214,7 +211,7 @@ def visualize_encoding(points,points_aug,RV_encode,radius=0,tag=None):
     cbar = fig.colorbar(pic, ax=ax,location = 'top', pad=0.0, shrink=0.4)
     #cbar.ax.set_xticks([])
     #cbar.ax.set_xticklabels([-2,-1,0,1],fontsize=12)
-    cbar.set_label("$v_{encode}$[m/s]",fontsize=16,labelpad=10)
+    cbar.set_label("$v_{%s}$[m/s]"%v_name,fontsize=16,labelpad=10)
     #ax.set_aspect('equal')
     #plt.subplots_adjust(left=0.08, bottom=0.08, right=0.95, top=0.98)
     plt.savefig("[%s]R1-3D.png"%tag,dpi=300)
