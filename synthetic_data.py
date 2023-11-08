@@ -43,7 +43,7 @@ class Synthetic(Instrument):
         NBATCH = len(batches)
         train_batches = batches#[:int(0.9*NBATCH)]
         #valid_batches = batches[int(0.9*NBATCH):int(0.95*NBATCH)]
-        valid_batches = test_batches = batches[int(0.9*NBATCH):]
+        valid_batches = test_batches = batches
 
         if which == "test": return test_batches
         elif which == "valid": return valid_batches

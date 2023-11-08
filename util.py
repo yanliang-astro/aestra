@@ -121,8 +121,8 @@ def density_plot(points,bins=30):
     mesh_dict = {"XY":[X,Y,density]}
     return mesh_dict
 
-def visualize_encoding(points,points_aug,v_target,v_name,
-                       radius=0,tag=None):
+def visualize_encoding(points,points_aug,color_target,v_name,
+                       radius=0,tag=None,cmap="viridis"):
 
     axis_mean = points.mean(axis=1,keepdims=True)
     axis_std = points.std(axis=1,keepdims=True)
@@ -164,10 +164,10 @@ def visualize_encoding(points,points_aug,v_target,v_name,
     depth /= depth.min()
     size = 40/depth**2+5
     #colors = points[0] 
-    colors = v_target
-    vmin,vmax=np.quantile(v_target,[0.05,0.95])
+    colors = color_target
+    vmin,vmax=np.quantile(color_target,[0.05,0.95])
     print("colors:",colors.min(),colors.max())
-    print("v_target:",v_target.min(),v_target.max())
+    print("color_target:",color_target.min(),color_target.max())
     #print("depth:",depth.shape)
     #print(size.min(),size.mean(),size.max())
     # 3D rendering
@@ -177,7 +177,7 @@ def visualize_encoding(points,points_aug,v_target,v_name,
     ax = plt.axes(projection ="3d")
     # Add x, y gridlines
     pic = ax.scatter(points[0], points[1], points[2], s=size, marker="o",
-                     alpha=1,c=colors,cmap="viridis",vmin=vmin,vmax=vmax)
+                     alpha=1,c=colors,cmap=cmap,vmin=vmin,vmax=vmax)
 
     xlim=(-3, 3)
     ylim=(-3, 3)
@@ -211,10 +211,10 @@ def visualize_encoding(points,points_aug,v_target,v_name,
     cbar = fig.colorbar(pic, ax=ax,location = 'top', pad=0.0, shrink=0.4)
     #cbar.ax.set_xticks([])
     #cbar.ax.set_xticklabels([-2,-1,0,1],fontsize=12)
-    cbar.set_label("$v_{%s}$[m/s]"%v_name,fontsize=16,labelpad=10)
+    cbar.set_label(v_name,fontsize=16,labelpad=10)
     #ax.set_aspect('equal')
     #plt.subplots_adjust(left=0.08, bottom=0.08, right=0.95, top=0.98)
-    plt.savefig("[%s]R1-3D.png"%tag,dpi=300)
+    plt.savefig("[%s]3D.png"%tag,dpi=300)
     exit()
     return
 
