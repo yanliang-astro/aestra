@@ -10,7 +10,6 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 from itertools import chain
 import pickle, humanize, psutil, GPUtil, io, random
-from torchinterp1d import Interp1d
 from torchcubicspline import natural_cubic_spline_coeffs
 from astropy.timeseries import LombScargle
 

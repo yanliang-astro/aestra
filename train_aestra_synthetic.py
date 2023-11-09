@@ -11,13 +11,13 @@ from accelerate import Accelerator
 import sys;sys.path.insert(1, './')
 from spender_model import SpectrumAutoencoder,NullRVEstimator
 from synthetic_data import Synthetic
-from util import mem_report
+from util import mem_report,cubic_transform
 from functools import partial
 from util import BatchedFilesDataset, load_batch
 from torch.utils.data import DataLoader,Dataset
-from torchinterp1d import Interp1d
 from line_profiler import LineProfiler
 from scipy.special import digamma
+
 
 def corrcoef(tensor, rowvar=True, bias=False):
     """Estimate a corrcoef matrix (np.corrcoef)
@@ -157,6 +157,7 @@ def _losses(model,
             instrument,
             batch,
             template=None,
+            telluric_model=1.0,
             similarity=False,
             slope=0,
             sigma_s=1.0,
@@ -169,6 +170,7 @@ def _losses(model,
 
     if fid: s = model.encode(spec-template)
     else: s = 0.0
+
     rv =  model.estimate_rv(spec-template)
     z = (rv)/instrument.c
 
@@ -176,7 +178,8 @@ def _losses(model,
 
     if fid:
         y_act, _, spectrum_observed = model._forward(spec, w, s, z)
-        fid_loss = model._loss(spec, w, spectrum_observed)
+
+        fid_loss = model._loss(spec, w, telluric_model*spectrum_observed)
         flex_loss = slope*(y_act**2/1.0).sum()
 
     if similarity:
@@ -196,15 +199,27 @@ def get_losses(model,
                slope=0,
                sigma_s=4,
                zloss=True,
-               skipfid=False
+               skipfid=False,
+               telluric=True
                ):
 
     zeropoint_loss = 0
 
-    loss,sim_loss,flex_loss,s,z = _losses(model, instrument, batch, similarity=similarity, slope=slope, sigma_s=sigma_s, fid=not skipfid,template=template)
+    if telluric:
+        t_latent = model.encode_sky(batch[0]-template)
+        t_rest = model.decode_sky(t_latent)
+        ssbrv_z = -1e3*(batch[2]-0.8)/Synthetic.c # move telluric lines
+        print("t_rest:",t_rest,"ssbrv_z:",ssbrv_z)
+        telluric_model = model.sky_decoder.transform(t_rest, ssbrv_z[:,None],
+                                                     instrument=instrument)
+        print("telluric_model:",telluric_model.min(),telluric_model.max())
+        
+    else: telluric_model = 1.0
+
+    loss,sim_loss,flex_loss,s,z = _losses(model, instrument, batch, similarity=similarity, slope=slope, sigma_s=sigma_s, fid=not skipfid,template=template,telluric_model=telluric_model)
 
     if zloss or consistency:
-        batch_copy = aug_fct(batch)
+        batch_copy = aug_fct(batch,telluric_model)
         fid_loss,_,_,s_,z_ = _losses(model, instrument,batch_copy, template=template,fid=False,similarity=False)
         z_off = z_ - z
         z_off_true = batch_copy[3]
@@ -483,8 +498,8 @@ if __name__ == "__main__":
     template_data = load_batch("%s%s-template.pkl"%(args.dir,args.data))
 
     if args.init: init_restframe = load_batch("%s%s-rest.pkl"%(args.dir,args.data))[0]
-    else: 
-        init_restframe = Interp1d()(instruments[0].wave_obs, template_data[0], wave_rest)
+    else:
+        init_restframe = cubic_transform(instruments[0].wave_obs, template_data[0], wave_rest[None,:])
 
     if args.double:
         template_data = [item.double() for item in template_data]
@@ -504,7 +519,7 @@ if __name__ == "__main__":
         print("similarity_slope:",len(ANNEAL_SCHEDULE),ANNEAL_SCHEDULE)
 
     # define and train the model
-    n_hidden = (64, 256, 1024)
+    n_hidden = (64, 256, 512)
     models = [ SpectrumAutoencoder(instrument,
                                    wave_rest,
                                    spec_rest=init_restframe,
@@ -546,7 +561,6 @@ if __name__ == "__main__":
           n_batch=args.batch_number, lr=args.rate, aug_fcts=aug_fcts, similarity=args.similarity, consistency=args.consistency, flexibility=args.flexibility, skipfid=args.skipfid,outfile=args.outfile, losses=losses, verbose=args.verbose)
     
     profiler.print_stats()
-    #train(models, instruments, trainloaders, validloaders, template_data, n_epoch=n_epoch,n_batch=args.batch_number, lr=args.rate, aug_fcts=aug_fcts, similarity=args.similarity, consistency=args.consistency, outfile=args.outfile, losses=losses, verbose=args.verbose)
 
     if args.verbose:
         print("--- %s seconds ---" % (time.time()-init_t))

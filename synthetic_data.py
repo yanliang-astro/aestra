@@ -4,7 +4,6 @@ import pickle
 import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader
-from torchinterp1d import Interp1d
 import astropy.io.fits as fits
 import astropy.table as aTable
 from functools import partial
@@ -14,7 +13,7 @@ from util import BatchedFilesDataset, load_batch, cubic_transform
 
 class Synthetic(Instrument):
     _wave_obs = torch.arange(5372.52,5476.09,0.01, dtype=torch.double)
-    wave_rest = torch.arange(5372.51, 5476.10,0.01, dtype=torch.double)
+    wave_rest = torch.arange(5372.50, 5476.11,0.01, dtype=torch.double)
     c = 299792458. # m/s
 
     def __init__(self, lsf=None, calibration=None):
@@ -73,7 +72,7 @@ class Synthetic(Instrument):
             cls.save_batch(dir, batch, select, tag=tag, counter=counter)
 
     @classmethod
-    def augment_spectra(cls,batch,noise=True,ratio=0.20):
+    def augment_spectra(cls,batch,telluric_model,noise=True,ratio=0.20):
         spec, w, _, ID = batch[:4]
         batch_size, spec_size = spec.shape
         device = spec.device
@@ -86,8 +85,10 @@ class Synthetic(Instrument):
         wave_redshifted = wave_obs - wave_obs*z_offset
 
         # redshift interpolation
-        spec_new = cubic_transform(wave_obs, spec, wave_redshifted)
+        spec_new = cubic_transform(wave_obs, spec/telluric_model, wave_redshifted)*telluric_model
         w_new = cubic_transform(wave_obs, w, wave_redshifted)
+
+        print("[augment]telluric_model:",telluric_model.min(),telluric_model.max())
 
         if noise:
             sigma = (w_new.mean(dim=-1)**(-0.5))[:,None]

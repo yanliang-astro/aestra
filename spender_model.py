@@ -1,7 +1,6 @@
 import numpy as np
 import torch
 from torch import nn
-from torchinterp1d import Interp1d
 from util import cubic_transform
 
 #### Simple MLP ####
@@ -262,12 +261,43 @@ class SpectrumDecoder(MLP):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class MultiLinearModel(nn.Module):
+    def __init__(self,
+                 wave_rest,
+                 n_latent=3,
+                 eigen_spectra=None,
+                ):
+
+        super(MultiLinearModel, self).__init__()
+
+        self.n_latent = n_latent
+        self.register_buffer('wave_rest', wave_rest)
+        # register wavelength tensors on the same device as the entire model
+        if eigen_spectra is None:
+            self.eigen_spectra= torch.nn.Parameter(0.01*torch.randn(len(wave_rest),n_latent))
+        else: self.eigen_spectra= torch.nn.Parameter(eigen_spectra)
+
+    def forward(self, s):
+        x = s[:,None,:]*self.eigen_spectra
+        return 1.0-x.sum(dim=2)
+
+    def transform(self, spectrum_restframe, z, instrument=None):
+        xx = self.wave_rest
+
+        wave_obs = instrument.wave_obs
+
+        wave_redshifted = - wave_obs * z + wave_obs
+        spectrum = cubic_transform(xx, spectrum_restframe, wave_redshifted)
+        return spectrum
+
 # Combine spectrum encoder and decoder
 class BaseAutoencoder(nn.Module):
     def __init__(self,
                  encoder,
                  decoder,
                  rv_estimator,
+                 sky_encoder,
+                 sky_decoder,
                  normalize=False,
                 ):
 
@@ -275,18 +305,25 @@ class BaseAutoencoder(nn.Module):
         assert encoder.n_latent == decoder.n_latent
         self.encoder = encoder
         self.decoder = decoder
+        self.sky_encoder = sky_encoder
+        self.sky_decoder = sky_decoder
         self.rv_estimator = rv_estimator
         self.normalize = normalize
 
     def encode(self, x, aux=None):
         return self.encoder(x, aux=aux)
 
+    def encode_sky(self, x):
+        return self.sky_encoder(x)
+
     def decode(self, x):
         return self.decoder(x)
 
     def estimate_rv(self,x):
-        # estimate z
         return self.rv_estimator(x)
+
+    def decode_sky(self, x):
+        return self.sky_decoder(x)
 
     def _forward(self, x, w, s, z, instrument=None, aux=None):
         if w.dim()==1:w=w.unsqueeze(1)
@@ -356,6 +393,8 @@ class SpectrumAutoencoder(BaseAutoencoder):
                  wave_rest,
                  spec_rest=None,
                  rv_estimator=None,
+                 sky_encoder=None,
+                 sky_decoder=None,
                  n_latent=10,
                  n_aux=0,
                  n_hidden=(64, 256, 1024),
@@ -375,11 +414,18 @@ class SpectrumAutoencoder(BaseAutoencoder):
 
         if rv_estimator==None:
             rv_estimator = RVEstimator(instrument.wave_obs.shape[0],sizes = [20,40])
-            #rv_estimator = NullRVEstimator()
+
+        if sky_encoder==None:
+            sky_encoder = SpectrumEncoder(instrument, n_latent)
+
+        if sky_decoder==None:
+            sky_decoder = MultiLinearModel(wave_rest, n_latent)
 
         super(SpectrumAutoencoder, self).__init__(
             encoder,
             decoder,
             rv_estimator,
+            sky_encoder,
+            sky_decoder,
             normalize=normalize,
         )
