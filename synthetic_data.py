@@ -21,7 +21,7 @@ class Synthetic(Instrument):
         super().__init__(Synthetic._wave_obs, lsf=lsf, calibration=calibration)
 
     @classmethod
-    def get_data_loader(cls, dir, select=None, which=None, tag=None, batch_size=30, shuffle=False):
+    def get_data_loader(cls, dir, select=None, which=None, tag=None, batch_size=30, shuffle=True):
         files = cls.list_batches(dir, select=select, 
                                  which=which, tag=tag)
         if which in ["train", "valid"]:
@@ -34,16 +34,16 @@ class Synthetic(Instrument):
 
     @classmethod
     def list_batches(cls, dir, select=None, which=None, tag=None):
-        if tag is None:tag = "chunk50"
+        #if tag is None:tag = "chunk50"
         if select is None:select = cls.__mro__[0].__name__
-        filename = f"{select}{tag}_*.pkl"
+        filename = f"{select}_*.pkl"
         batch_files = glob.glob(dir + "/" + filename)
-        batches = [item for item in batch_files if not "copy" in item]
+        batches = [item for item in batch_files if not "template" in item]
 
         NBATCH = len(batches)
         train_batches = batches#[:int(0.9*NBATCH)]
-        #valid_batches = batches[int(0.9*NBATCH):int(0.95*NBATCH)]
-        valid_batches = test_batches = batches
+        valid_batches = test_batches= batches[int(0.9*NBATCH):]
+        #valid_batches = test_batches = batches
 
         if which == "test": return test_batches
         elif which == "valid": return valid_batches
@@ -80,28 +80,29 @@ class Synthetic(Instrument):
         wave_obs = cls._wave_obs.to(device)
 
         # uniform distribution of redshift offsets
-        z_lim = 2e-8 # 6 m/s
+        z_lim = 5e-8 # 15 m/s
         z_offset = z_lim*(torch.rand(batch_size,1, device=device)-0.5)
 
         wave_redshifted = wave_obs - wave_obs*z_offset
 
         # redshift interpolation
         spec_new = cubic_transform(wave_obs, spec, wave_redshifted)
-        w_new = cubic_transform(wave_obs, w, wave_redshifted)
+        w_new = 1
+        #cubic_transform(wave_obs, w, wave_redshifted)
 
         if noise:
-            sigma = (w_new.mean(dim=-1)**(-0.5))[:,None]
+            sigma = (w.mean(dim=-1)**(-0.5))[:,None]
             spec_noise = sigma*torch.normal(mean=0,std=1.0,size=spec.shape,
                                             device=device)
             noise_mask = torch.rand(spec.shape).to(device)>ratio
             spec_noise[noise_mask]=0
             spec_new += spec_noise
-            w_new = 1 / (1 / (w_new) + spec_noise**2)
+            #w_new = 1 / (1 / (w_new) + spec_noise**2)
         if spec.dtype==torch.float32:spec_new=spec_new.float()
         # ensure extrapolated values have zero weights
         wmin = wave_obs.min()
         wmax = wave_obs.max()
         out = (wave_redshifted<wmin)|(wave_redshifted>wmax)
         spec_new[out] = 1
-        w_new[out] = 0
+        #w_new[out] = 0
         return spec_new, w_new, _, z_offset

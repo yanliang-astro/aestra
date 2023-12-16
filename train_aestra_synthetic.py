@@ -161,6 +161,7 @@ def _losses(model,
             slope=0,
             sigma_s=1.0,
             fid=True,
+            skipz=False,
             mi=False):
 
     spec, w, _, ID = batch
@@ -169,7 +170,11 @@ def _losses(model,
 
     if fid: s = model.encode(spec-template)
     else: s = 0.0
-    rv =  model.estimate_rv(spec-template)
+
+    if skipz:
+        rv = torch.zeros((len(spec),1),device=spec.device)
+    else:rv =  model.estimate_rv(spec-template)
+
     z = (rv)/instrument.c
 
     fid_loss = sim_loss = flex_loss = 0
@@ -177,7 +182,7 @@ def _losses(model,
     if fid:
         y_act, _, spectrum_observed = model._forward(spec, w, s, z)
         fid_loss = model._loss(spec, w, spectrum_observed)
-        flex_loss = slope*(y_act**2/1.0).sum()
+        flex_loss = slope*(y_act**2/1).sum()
 
     if similarity:
         sim_loss = similarity_restframe(instrument, model, s, slope=slope,sigma_s=sigma_s)
@@ -194,23 +199,24 @@ def get_losses(model,
                consistency=True,
                flexibility=True,
                slope=0,
-               sigma_s=4,
+               sigma_s=2,
                zloss=True,
-               skipfid=False
+               skipfid=False,
+               skipz=False
                ):
 
     zeropoint_loss = 0
 
-    loss,sim_loss,flex_loss,s,z = _losses(model, instrument, batch, similarity=similarity, slope=slope, sigma_s=sigma_s, fid=not skipfid,template=template)
+    loss,sim_loss,flex_loss,s,z = _losses(model, instrument, batch, similarity=similarity, slope=slope, sigma_s=sigma_s, fid=not skipfid,skipz=skipz,template=template)
 
-    if zloss or consistency:
+    if not skipz and (zloss or consistency):
         batch_copy = aug_fct(batch)
-        fid_loss,_,_,s_,z_ = _losses(model, instrument,batch_copy, template=template,fid=False,similarity=False)
+        fid_loss,_,_,s_,z_ = _losses(model, instrument,batch_copy, template=template,fid=False,skipz=skipz,similarity=False)
         z_off = z_ - z
         z_off_true = batch_copy[3]
         #flex_loss = fid_loss
 
-    if zloss:
+    if not skipz and zloss:
         z_loss = z_offset_loss(z_off, z_off_true)
         print("z_loss:",z_loss.item(),
               "RV: %.2f, %.2f"%(Synthetic.c*z.min(),
@@ -279,7 +285,8 @@ def train(models,
           similarity=True,
           consistency=True,
           flexibility=True,
-          skipfid=False
+          skipfid=False,
+          skipz=False
           ):
 
     n_encoder = len(models)
@@ -379,7 +386,8 @@ def train(models,
                     consistency=consistency,
                     flexibility=flexibility,
                     slope=slope,
-                    skipfid=skipfid
+                    skipfid=skipfid,
+                    skipz=skipz
                 )
                 # sum up all losses
                 loss = functools.reduce(lambda a, b: a+b , losses)
@@ -400,7 +408,7 @@ def train(models,
             detailed_loss[0][which][epoch_] /= n_sample
 
         scheduler.step()
-
+        '''
         with torch.no_grad():
             for which in range(n_encoder):
                 models[which].eval()
@@ -419,7 +427,8 @@ def train(models,
                         consistency=consistency,
                         flexibility=flexibility,
                         slope=slope,
-                        skipfid=skipfid
+                        skipfid=skipfid,
+                        skipz=skipz
                     )
                     # logging: validation
                     detailed_loss[1][which][epoch_] += tuple( l.item() if hasattr(l, 'item') else 0 for l in losses )
@@ -430,7 +439,7 @@ def train(models,
                         break
 
                 detailed_loss[1][which][epoch_] /= n_sample
-
+        '''
         if verbose:
             #mem_report()
             losses = tuple(detailed_loss[0, :, epoch_, :])
@@ -439,7 +448,7 @@ def train(models,
             print('TRAINING Losses:', losses)
             print('VALIDATION Losses:', vlosses)
 
-        if epoch_ % 60 == 0 or epoch_ == n_epoch - 1:
+        if epoch_ % 20 == 0 or epoch_ == n_epoch - 1:
             args = models
             checkpoint(accelerator, args, optimizer, scheduler, n_encoder, outfile, detailed_loss)
 
@@ -458,6 +467,7 @@ if __name__ == "__main__":
     parser.add_argument("-it", "--iteration", help="number of interation", type=int, default=100000)
     parser.add_argument("-s", "--similarity", help="add similarity loss", action="store_true")
     parser.add_argument("-skipfid", "--skipfid", help="skip fidelity loss", action="store_true",default=False)
+    parser.add_argument("-skipz", "--skipz", help="skip rv loss", action="store_true",default=False)
     parser.add_argument("-c", "--consistency", help="add consistency loss", action="store_true")
     parser.add_argument("-d", "--double", help="double precision", action="store_true",default=False)
     parser.add_argument("-init", "--init", help="initialize restframe", action="store_true",default=False)
@@ -475,10 +485,10 @@ if __name__ == "__main__":
     wave_rest = Synthetic.wave_rest
 
     # data loaders
-    trainloaders = [ get_data_loader(args.dir, select=args.data, which="train",
-                     batch_size=args.batch_size,double=args.double) for inst in instruments ]
-    validloaders = [ get_data_loader(args.dir, select=args.data, which="train",
-                     batch_size=args.batch_size,double=args.double) for inst in instruments ]
+    trainloaders = [ inst.get_data_loader(args.dir, select=args.data, which="train",
+                     batch_size=args.batch_size) for inst in instruments ]
+    validloaders = [ inst.get_data_loader(args.dir, select=args.data, which="valid",
+                     batch_size=args.batch_size) for inst in instruments ]
 
     template_data = load_batch("%s%s-template.pkl"%(args.dir,args.data))
 
@@ -543,7 +553,7 @@ if __name__ == "__main__":
     profiler.add_function(load_batch)
     lpWrapper = profiler(train)
     lpWrapper(models, instruments, trainloaders, validloaders, template_data, n_epoch=n_epoch,
-          n_batch=args.batch_number, lr=args.rate, aug_fcts=aug_fcts, similarity=args.similarity, consistency=args.consistency, flexibility=args.flexibility, skipfid=args.skipfid,outfile=args.outfile, losses=losses, verbose=args.verbose)
+          n_batch=args.batch_number, lr=args.rate, aug_fcts=aug_fcts, similarity=args.similarity, consistency=args.consistency, flexibility=args.flexibility, skipfid=args.skipfid,skipz=args.skipz,outfile=args.outfile, losses=losses, verbose=args.verbose)
     
     profiler.print_stats()
     #train(models, instruments, trainloaders, validloaders, template_data, n_epoch=n_epoch,n_batch=args.batch_number, lr=args.rate, aug_fcts=aug_fcts, similarity=args.similarity, consistency=args.consistency, outfile=args.outfile, losses=losses, verbose=args.verbose)
