@@ -71,37 +71,37 @@ class Synthetic(Instrument):
             batch = cls.make_batch(ids_)
             cls.save_batch(dir, batch, select, tag=tag, counter=counter)
 
-    @classmethod
-    def augment_spectra(cls,batch,noise=True,ratio=0.20):
+    def augment_spectra(self,batch,noise=True,ratio=0.20):
         spec, w, _, ID = batch[:4]
-        batch_size, spec_size = spec.shape
+        batch_size, n_order, spec_size = spec.shape
         device = spec.device
-        wave_obs = cls._wave_obs.to(device)
+        wave_obs = self.wave_obs#.to(device)
 
         # uniform distribution of redshift offsets
         z_lim = 5e-8 # 15 m/s
         z_offset = z_lim*(torch.rand(batch_size,1, device=device)-0.5)
 
-        wave_redshifted = wave_obs - wave_obs*z_offset
+        spec_new = torch.zeros_like(spec)
+        out = torch.zeros_like(spec,dtype=bool)
+        for i in range(n_order):
+            wave_redshifted = wave_obs[i] - wave_obs[i]*z_offset
 
-        # redshift interpolation
-        spec_new = cubic_transform(wave_obs, spec, wave_redshifted)
-        w_new = 1
-        #cubic_transform(wave_obs, w, wave_redshifted)
+            # redshift interpolation
+            spec_new[:,i,:] = cubic_transform(wave_obs[i], spec[:,i,:], wave_redshifted)
+
+            if spec.dtype==torch.float32:spec_new=spec_new.float()
+            # ensure extrapolated values have zero weights
+            wmin = wave_obs[i].min()
+            wmax = wave_obs[i].max()
+            out_ = (wave_redshifted<wmin)|(wave_redshifted>wmax)
+            out[:,i,:] = out_
+        spec_new[out] = 1
 
         if noise:
-            sigma = (w.mean(dim=-1)**(-0.5))[:,None]
+            sigma = w**(-0.5)
             spec_noise = sigma*torch.normal(mean=0,std=1.0,size=spec.shape,
                                             device=device)
             noise_mask = torch.rand(spec.shape).to(device)>ratio
             spec_noise[noise_mask]=0
             spec_new += spec_noise
-            #w_new = 1 / (1 / (w_new) + spec_noise**2)
-        if spec.dtype==torch.float32:spec_new=spec_new.float()
-        # ensure extrapolated values have zero weights
-        wmin = wave_obs.min()
-        wmax = wave_obs.max()
-        out = (wave_redshifted<wmin)|(wave_redshifted>wmax)
-        spec_new[out] = 1
-        #w_new[out] = 0
-        return spec_new, w_new, _, z_offset
+        return spec_new, 1, _, z_offset

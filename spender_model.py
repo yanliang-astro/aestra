@@ -63,14 +63,15 @@ class SpeculatorActivation(nn.Module):
 
 class RVEstimator(nn.Module):
     def __init__(self,
-                 n_in,
+                 input_shape,
                  sizes = [5,10],
                  n_hidden=(128, 64, 32),
                  act=(nn.PReLU(128),nn.PReLU(64),nn.PReLU(32), nn.Identity()),
                  dropout=0):
         super(RVEstimator, self).__init__()
+        n_order,n_in = input_shape
 
-        filters = [128,64]
+        filters = [n_order,128,64]
         self.conv1,self.conv2 = self._conv_blocks(filters, sizes, dropout=dropout)
         self.n_feature = filters[-1] * ((n_in //sizes[0])//sizes[1])
 
@@ -82,10 +83,10 @@ class RVEstimator(nn.Module):
 
     def _conv_blocks(self, filters, sizes, dropout=0):
         convs = []
-        for i in range(len(filters)):
-            f_in = 1 if i == 0 else filters[i-1]
+        for i in range(1,len(filters)):
+            f_in = filters[i-1]
             f = filters[i]
-            s = sizes[i]
+            s = sizes[i-1]
             p = s // 2
             conv = nn.Conv1d(in_channels=f_in,
                              out_channels=f,
@@ -100,7 +101,6 @@ class RVEstimator(nn.Module):
 
     def forward(self, x):
         # compression
-        x = x.unsqueeze(1)
         x = self.pool1(self.conv1(x))
         x = self.pool2(self.conv2(x))
         x = self.softmax(x)
@@ -374,7 +374,7 @@ class SpectrumAutoencoder(BaseAutoencoder):
         )
 
         if rv_estimator==None:
-            rv_estimator = RVEstimator(instrument.wave_obs.shape[0],sizes = [20,40])
+            rv_estimator = RVEstimator(instrument.wave_obs.shape,sizes = [20,40])
             #rv_estimator = NullRVEstimator()
 
         super(SpectrumAutoencoder, self).__init__(
