@@ -13,12 +13,11 @@ from instrument import Instrument
 from util import BatchedFilesDataset, load_batch, cubic_transform
 
 class Synthetic(Instrument):
-    _wave_obs = torch.arange(5372.52,5476.09,0.01, dtype=torch.double)
-    wave_rest = torch.arange(5372.51, 5476.10,0.01, dtype=torch.double)
     c = 299792458. # m/s
 
-    def __init__(self, lsf=None, calibration=None):
-        super().__init__(Synthetic._wave_obs, lsf=lsf, calibration=calibration)
+    def __init__(self, wave_obs, lsf=None, calibration=None):
+        super().__init__(wave_obs, lsf=lsf, calibration=calibration)
+        self.register_buffer('wave_obs', wave_obs)
 
     @classmethod
     def get_data_loader(cls, dir, select=None, which=None, tag=None, batch_size=30, shuffle=True):

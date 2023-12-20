@@ -476,13 +476,15 @@ if __name__ == "__main__":
     parser.add_argument("-v", "--verbose", help="verbose printing", action="store_true")
     args = parser.parse_args()
 
+    wave_obs = load_batch("%s%s-wavelength.pkl"%(args.dir,args.data))
+    wave_rest = wave_obs
+
     # define instruments
-    instruments = [ Synthetic() ]
+    instruments = [ Synthetic(wave_obs) ]
     n_encoder = len(instruments)
 
     # restframe wavelength for reconstructed spectra
     #lmbda_min = 4999.0;lmbda_max = 5011.0;bins = 1200
-    wave_rest = Synthetic.wave_rest
 
     # data loaders
     trainloaders = [ inst.get_data_loader(args.dir, select=args.data, which="train",
@@ -492,9 +494,11 @@ if __name__ == "__main__":
 
     template_data = load_batch("%s%s-template.pkl"%(args.dir,args.data))
 
+
     if args.init: init_restframe = load_batch("%s%s-rest.pkl"%(args.dir,args.data))[0]
-    else: 
-        init_restframe = Interp1d()(instruments[0].wave_obs, template_data[0], wave_rest)
+    else:
+        #init_restframe = Interp1d()(wave_obs, template_data[0], wave_rest)
+        init_restframe = template_data[0]
 
     if args.double:
         template_data = [item.double() for item in template_data]
