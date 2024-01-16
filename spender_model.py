@@ -25,6 +25,22 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.mlp(x)
 
+#### MLP with multiple output channels####
+class MultipleMLP(nn.Module):
+    def __init__(self,
+                 n_in,
+                 n_out,
+                 n_channel=1,
+                 n_hidden=(16, 16, 16),
+                 act=(nn.LeakyReLU(), nn.LeakyReLU(), nn.LeakyReLU(), nn.LeakyReLU()),
+                 dropout=0):
+        super(MultipleMLP, self).__init__()
+        self.mlp = nn.ModuleList([MLP(n_in,n_out,n_hidden=n_hidden,act=act,dropout=dropout) for i in range(n_channel)])
+
+    def forward(self, x):
+        x = [mlp(x)[:,None,:] for mlp in self.mlp]
+        x = torch.cat(x,dim=1)
+        return x
 
 class SpeculatorActivation(nn.Module):
     """Activation function from the Speculator paper
@@ -132,8 +148,10 @@ class SpectrumEncoder(nn.Module):
         self.instrument = instrument
         self.n_latent = n_latent
         self.n_aux = n_aux
+        self.n_order = instrument.wave_obs.shape[0]
 
-        filters = [128, 256, 512]
+
+        filters = [self.n_order, 128, 256, 512]
         sizes = [5, 11, 21]
         self.conv1, self.conv2, self.conv3 = self._conv_blocks(filters, sizes, dropout=dropout)
         self.n_feature = filters[-1] // 2
@@ -147,10 +165,10 @@ class SpectrumEncoder(nn.Module):
 
     def _conv_blocks(self, filters, sizes, dropout=0):
         convs = []
-        for i in range(len(filters)):
-            f_in = 1 if i == 0 else filters[i-1]
+        for i in range(1,len(filters)):
+            f_in = filters[i-1]
             f = filters[i]
-            s = sizes[i]
+            s = sizes[i-1]
             p = s // 2
             conv = nn.Conv1d(in_channels=f_in,
                              out_channels=f,
@@ -165,7 +183,7 @@ class SpectrumEncoder(nn.Module):
 
     def _downsample(self, x):
         # compression
-        x = x.unsqueeze(1)
+        #x = x.unsqueeze(1)
         x = self.pool1(self.conv1(x))
         x = self.pool2(self.conv2(x))
         x = self.conv3(x)
@@ -195,7 +213,7 @@ class SpectrumEncoder(nn.Module):
 
 #### Spectrum decoder ####
 #### Simple MLP but with explicit redshift and instrument path ####
-class SpectrumDecoder(MLP):
+class SpectrumDecoder(MultipleMLP):
     def __init__(self,
                  wave_rest,
                  spec_rest,
@@ -206,6 +224,9 @@ class SpectrumDecoder(MLP):
                  datatag="mockdata",
                 ):
 
+        n_channel,n_spec = wave_rest.shape
+        print("wave_rest:",wave_rest.shape)
+
         if act==None: 
             act = [nn.LeakyReLU() for i in range(len(n_hidden)+1)]
             #act = [SpeculatorActivation(n) for n in n_hidden]
@@ -213,7 +234,8 @@ class SpectrumDecoder(MLP):
 
         super(SpectrumDecoder, self).__init__(
             n_latent,
-            len(wave_rest),
+            n_spec,
+            n_channel=n_channel,
             n_hidden=n_hidden,
             act=act,
             dropout=dropout,
@@ -224,7 +246,7 @@ class SpectrumDecoder(MLP):
         self.decode_act = nn.LeakyReLU()
         # register wavelength tensors on the same device as the entire model
         if spec_rest is None:
-            self.spec_rest= torch.nn.Parameter(torch.randn(len(wave_rest)))
+            self.spec_rest= torch.nn.Parameter(torch.randn(wave_rest.shape))
         else: self.spec_rest= torch.nn.Parameter(spec_rest)
         self.register_buffer('wave_rest', wave_rest)
 
@@ -244,8 +266,13 @@ class SpectrumDecoder(MLP):
         else:
             wave_obs = instrument.wave_obs
 
-        wave_redshifted = - wave_obs * z + wave_obs
-        spectrum = cubic_transform(xx, spectrum_restframe, wave_redshifted)
+        n_order, n_spec = wave_obs.shape
+        batch_size = spectrum_restframe.shape[0]
+
+        spectrum = torch.zeros((batch_size,n_order, n_spec), device=wave_obs.device)
+        for i in range(n_order):
+            wave_redshifted = - wave_obs[i] * z + wave_obs[i]
+            spectrum[:,i,:] = cubic_transform(xx[i], spectrum_restframe[:,i,:], wave_redshifted)
 
         # convolve with LSF
         if instrument.lsf is not None:
@@ -323,7 +350,8 @@ class BaseAutoencoder(nn.Module):
         # to make it to order unity for comparing losses, divide out L (number of bins)
         # instead of D, so that spectra with more valid bins have larger impact
         if w.dim()==1:w=w.unsqueeze(1)
-        loss_ind = torch.sum(w * (x - spectrum_observed).pow(2), dim=1) / x.shape[1]
+        loss_ind = torch.sum(w * (x - spectrum_observed).pow(2), dim=-1) / x.shape[-1]
+        loss_ind = torch.mean(loss_ind,dim=-1)
 
         if individual:
             return loss_ind

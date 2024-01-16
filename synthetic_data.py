@@ -99,6 +99,8 @@ class Synthetic(Instrument):
 
         if noise:
             sigma = w**(-0.5)
+            sigma[out] = 0
+            sigma[sigma>1] = 0
             spec_noise = sigma*torch.normal(mean=0,std=1.0,size=spec.shape,
                                             device=device)
             noise_mask = torch.rand(spec.shape).to(device)>ratio

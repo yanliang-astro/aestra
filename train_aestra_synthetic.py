@@ -489,8 +489,7 @@ if __name__ == "__main__":
     # data loaders
     trainloaders = [ inst.get_data_loader(args.dir, select=args.data, which="train",
                      batch_size=args.batch_size) for inst in instruments ]
-    validloaders = [ inst.get_data_loader(args.dir, select=args.data, which="valid",
-                     batch_size=args.batch_size) for inst in instruments ]
+    validloaders = []
 
     template_data = load_batch("%s%s-template.pkl"%(args.dir,args.data))
 
@@ -505,7 +504,7 @@ if __name__ == "__main__":
         if args.init: init_restframe = init_restframe.double()
 
     # get augmentation function
-    aug_fcts = [ Synthetic.augment_spectra ]
+    aug_fcts = [ inst.augment_spectra  for inst in instruments]
 
     # define training sequence
     FULL = {"data":[True],"encoder":[True],"rv":[True],
