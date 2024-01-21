@@ -84,6 +84,8 @@ def get_all_parameters(models,instruments):
         model_params += model.rv_estimator.parameters()
     # 1 decoder
     model_params += model.decoder.parameters()
+    # 1 telluric model
+    model_params += model.telluric.parameters()
     dicts = [{'params':model_params}]
 
     n_parameters = sum([p.numel() for p in model_params if p.requires_grad])
@@ -164,7 +166,7 @@ def _losses(model,
             skipz=False,
             mi=False):
 
-    spec, w, _, ID = batch
+    spec, w, ssbrv, ID = batch
 
     if template==None: template = 0
 
@@ -180,9 +182,12 @@ def _losses(model,
     fid_loss = sim_loss = flex_loss = 0
 
     if fid:
-        y_act, _, spectrum_observed = model._forward(spec, w, s, z)
+        y_act, _, spectrum_observed = model._forward(spec, w, s, z, z_sky=(1e3*ssbrv/instrument.c))
         fid_loss = model._loss(spec, w, spectrum_observed)
-        flex_loss = slope*(y_act**2/1).sum()
+        #flex_loss = slope*(y_act**2/(1.0)).sum()
+        # explicitly suppress telluric region
+        flex_loss = (model.telluric.skymask*y_act**2/0.1**2).sum()
+        print("slope:",slope,"flex_loss:",flex_loss)
 
     if similarity:
         sim_loss = similarity_restframe(instrument, model, s, slope=slope,sigma_s=sigma_s)
@@ -366,6 +371,9 @@ def train(models,
             for p in models[which].rv_estimator.parameters():
                 p.requires_grad = mode['rv'][which]
 
+            for p in models[which].telluric.parameters():
+                p.requires_grad = True
+
             # optional: training on single dataset
             if not mode['data'][which]:
                 continue
@@ -448,7 +456,7 @@ def train(models,
             print('TRAINING Losses:', losses)
             print('VALIDATION Losses:', vlosses)
 
-        if epoch_ % 20 == 0 or epoch_ == n_epoch - 1:
+        if epoch_ % 10 == 0 or epoch_ == n_epoch - 1:
             args = models
             checkpoint(accelerator, args, optimizer, scheduler, n_encoder, outfile, detailed_loss)
 
@@ -477,6 +485,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     wave_obs = load_batch("%s%s-wavelength.pkl"%(args.dir,args.data))
+    telluric = load_batch("%s%s-telluric.pkl"%(args.dir,args.data))
+    skymask = load_batch("%s%s-skymask.pkl"%(args.dir,args.data))
     wave_rest = wave_obs
 
     # define instruments
@@ -497,7 +507,7 @@ if __name__ == "__main__":
     if args.init: init_restframe = load_batch("%s%s-rest.pkl"%(args.dir,args.data))[0]
     else:
         #init_restframe = Interp1d()(wave_obs, template_data[0], wave_rest)
-        init_restframe = template_data[0]
+        init_restframe = (template_data[0]/telluric)
 
     if args.double:
         template_data = [item.double() for item in template_data]
@@ -521,12 +531,17 @@ if __name__ == "__main__":
     models = [ SpectrumAutoencoder(instrument,
                                    wave_rest,
                                    spec_rest=init_restframe,
+                                   spec_telluric=telluric,
+                                   skymask=skymask,
                                    n_latent=args.latents,
                                    n_hidden=n_hidden,
                                    n_aux=0,
                                    normalize=False)
               for instrument in instruments ]
-    print("RVEstimator:",models[0].rv_estimator)
+    #print("RVEstimator:",models[0].rv_estimator)
+    print("Encoder: n_latent=%d"%models[0].encoder.n_latent)
+    print("Decoder: n_latent=%d"%models[0].decoder.n_latent)
+    print("Telluric: n_component=%d"%models[0].telluric.n_component)
 
     # use same decoder
     if n_encoder==2:models[1].decoder = models[0].decoder

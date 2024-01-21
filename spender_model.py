@@ -211,6 +211,47 @@ class SpectrumEncoder(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class TelluricModel(nn.Module):
+    def __init__(self,
+                 wave_rest,
+                 n_component=2,
+                 eigen_spectra=None,
+                 skymask=None,
+                ):
+
+        super(TelluricModel, self).__init__()
+
+        self.n_component = n_component
+        self.act = nn.LeakyReLU()
+        self.register_buffer('wave_rest', wave_rest)
+        self.register_buffer('skymask', skymask)
+
+        n_order,n_spec = wave_rest.shape
+        initial = 1e-2*torch.randn(n_order,n_component,n_spec)
+    
+        if eigen_spectra is None:
+            self.eigen_spectra= torch.nn.Parameter(initial)
+        elif eigen_spectra.ndim==3: initial = eigen_spectra
+        else: initial[:,0,:] = eigen_spectra # replace first dimension
+        self.eigen_spectra= torch.nn.Parameter(initial)
+
+    def forward(self, s, z, instrument):
+        x = s[:,None,:,None]*self.eigen_spectra[None,:,:,:]
+        x = x.sum(dim=2)
+        x = self.transform(x,z,instrument)
+        x = 1-self.act(x)
+        return x
+
+    def transform(self, spectrum_restframe, z, instrument):
+        xx = self.wave_rest
+        wave_obs = instrument.wave_obs
+        n_batch,n_order,n_spec = spectrum_restframe.shape
+        spectrum = torch.ones((n_batch,n_order,n_spec),device=z.device)
+        for i in range(n_order):
+            wave_redshifted = - wave_obs[i] * z[:,[i]] + wave_obs[i]
+            spectrum[:,i,:] = cubic_transform(xx[i], spectrum_restframe[:,i,:], wave_redshifted)
+        return spectrum
+
 #### Spectrum decoder ####
 #### Simple MLP but with explicit redshift and instrument path ####
 class SpectrumDecoder(MultipleMLP):
@@ -295,14 +336,16 @@ class BaseAutoencoder(nn.Module):
                  encoder,
                  decoder,
                  rv_estimator,
+                 telluric,
                  normalize=False,
                 ):
 
         super(BaseAutoencoder, self).__init__()
-        assert encoder.n_latent == decoder.n_latent
+        assert encoder.n_latent == (decoder.n_latent+telluric.n_component)
         self.encoder = encoder
         self.decoder = decoder
         self.rv_estimator = rv_estimator
+        self.telluric = telluric
         self.normalize = normalize
 
     def encode(self, x, aux=None):
@@ -315,17 +358,23 @@ class BaseAutoencoder(nn.Module):
         # estimate z
         return self.rv_estimator(x)
 
-    def _forward(self, x, w, s, z, instrument=None, aux=None):
+    def _forward(self, x, w, s, z, z_sky=None, instrument=None, aux=None):
         if w.dim()==1:w=w.unsqueeze(1)
 
         if instrument is None:
             instrument = self.encoder.instrument
 
+        s_star = s[:,:self.decoder.n_latent]
+        s_sky = s[:,self.decoder.n_latent:]
+
         if self.decoder.spec_rest == None: baseline = 1.0
         else: baseline = self.decoder.spec_rest
-        spectrum_activity = self.decode(s)
+        spectrum_activity = self.decode(s_star)
         spectrum_restframe = baseline+spectrum_activity
         spectrum_observed = self.decoder.transform(spectrum_restframe, z, instrument=instrument)
+        if z_sky is None: spectrum_telluric = 1
+        else: spectrum_telluric = self.telluric(s_sky,z_sky,instrument)
+        spectrum_observed *= spectrum_telluric
 
         if self.normalize:
             c = self._normalization(x, spectrum_observed, w=w)
@@ -383,8 +432,11 @@ class SpectrumAutoencoder(BaseAutoencoder):
                  instrument,
                  wave_rest,
                  spec_rest=None,
+                 spec_telluric=None,
                  rv_estimator=None,
+                 skymask=None,
                  n_latent=10,
+                 n_telluric=2,
                  n_aux=0,
                  n_hidden=(64, 256, 1024),
                  act=None,
@@ -396,10 +448,12 @@ class SpectrumAutoencoder(BaseAutoencoder):
         decoder = SpectrumDecoder(
             wave_rest,
             spec_rest,
-            n_latent,
+            (n_latent-n_telluric),
             n_hidden=n_hidden,
             act=act,
         )
+
+        telluric = TelluricModel(wave_rest,eigen_spectra=(1-spec_telluric),skymask=skymask,n_component=n_telluric)
 
         if rv_estimator==None:
             rv_estimator = RVEstimator(instrument.wave_obs.shape,sizes = [20,40])
@@ -409,5 +463,6 @@ class SpectrumAutoencoder(BaseAutoencoder):
             encoder,
             decoder,
             rv_estimator,
+            telluric,
             normalize=normalize,
         )
