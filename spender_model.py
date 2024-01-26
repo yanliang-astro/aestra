@@ -210,41 +210,67 @@ class SpectrumEncoder(nn.Module):
     def n_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+class PolynomialContinuum(nn.Module):
+    def __init__(self,
+                 n_in,
+                 wave_rest,
+                 deg=5,
+                 n_channel=1,
+                 n_hidden=(16),
+                 act=(nn.LeakyReLU(),nn.LeakyReLU())):
+        super(PolynomialContinuum, self).__init__()
+        self.deg = deg
+        self.mlp = MultipleMLP(n_in,self.deg+1,n_channel=n_channel,
+                               n_hidden=n_hidden,act=act)
+        self.register_buffer('xx', torch.linspace(-1,1,wave_rest.shape[1]))
+
+    def forward(self,s):
+        powers = torch.arange(self.deg, -1, -1, device=s.device)
+        coefficients = self.mlp(s)
+        batch_size, n_order, n_coeff = coefficients.shape
+        poly_terms = self.xx[None,:,None].pow(powers)
+        y_continuum = 1+torch.sum(coefficients.unsqueeze(2) * poly_terms, dim=3)
+        return y_continuum
 
 class TelluricModel(nn.Module):
     def __init__(self,
                  wave_rest,
-                 n_component=2,
-                 eigen_spectra=None,
+                 instrument,
+                 n_latent=3,
                  skymask=None,
                 ):
 
         super(TelluricModel, self).__init__()
-
-        self.n_component = n_component
-        self.act = nn.LeakyReLU()
+        n_channel,n_spec = wave_rest.shape
+        self.n_latent = n_latent
+        self.instrument = instrument
+        self.encoder = SpectrumEncoder(instrument, n_latent)
+        self.decoder = MultipleMLP(n_latent,n_spec,n_channel=n_channel,n_hidden=())
+        self.continuum = PolynomialContinuum(n_latent,wave_rest,n_channel=n_channel,
+                                             n_hidden=())
         self.register_buffer('wave_rest', wave_rest)
         self.register_buffer('skymask', skymask)
+        # initialize weights to avoid large fluctuation
+        for p in self.decoder.parameters():torch.nn.init.normal_(p,std=1e-4)
+        for p in self.continuum.parameters():torch.nn.init.normal_(p,std=1e-4)
 
-        n_order,n_spec = wave_rest.shape
-        initial = 1e-2*torch.randn(n_order,n_component,n_spec)
-    
-        if eigen_spectra is None:
-            self.eigen_spectra= torch.nn.Parameter(initial)
-        elif eigen_spectra.ndim==3: initial = eigen_spectra
-        else: initial[:,0,:] = eigen_spectra # replace first dimension
-        self.eigen_spectra= torch.nn.Parameter(initial)
+    def encode(self, x):
+        return self.encoder(x)
 
-    def forward(self, s, z, instrument):
-        x = s[:,None,:,None]*self.eigen_spectra[None,:,:,:]
-        x = x.sum(dim=2)
-        x = self.transform(x,z,instrument)
-        x = 1-self.act(x)
+    def forward(self, s, z):
+        x = self.decoder(s)
+        x = self.continuum(s) - self.transform(x,z)
         return x
 
-    def transform(self, spectrum_restframe, z, instrument):
+    def _forward(self, s, z):
+        x_lines = self.decoder(s)
+        x_background = self.continuum(s)
+        x = x_background - self.transform(x_lines,z)
+        return x_lines,x_background,x
+
+    def transform(self, spectrum_restframe, z):
         xx = self.wave_rest
-        wave_obs = instrument.wave_obs
+        wave_obs = self.instrument.wave_obs
         n_batch,n_order,n_spec = spectrum_restframe.shape
         spectrum = torch.ones((n_batch,n_order,n_spec),device=z.device)
         for i in range(n_order):
@@ -341,7 +367,7 @@ class BaseAutoencoder(nn.Module):
                 ):
 
         super(BaseAutoencoder, self).__init__()
-        assert encoder.n_latent == (decoder.n_latent+telluric.n_component)
+        assert encoder.n_latent == decoder.n_latent
         self.encoder = encoder
         self.decoder = decoder
         self.rv_estimator = rv_estimator
@@ -358,23 +384,17 @@ class BaseAutoencoder(nn.Module):
         # estimate z
         return self.rv_estimator(x)
 
-    def _forward(self, x, w, s, z, z_sky=None, instrument=None, aux=None):
+    def _forward(self, x, w, s_star, z, s_sky=None,z_sky=None, instrument=None, aux=None):
         if w.dim()==1:w=w.unsqueeze(1)
 
         if instrument is None:
             instrument = self.encoder.instrument
-
-        s_star = s[:,:self.decoder.n_latent]
-        s_sky = s[:,self.decoder.n_latent:]
 
         if self.decoder.spec_rest == None: baseline = 1.0
         else: baseline = self.decoder.spec_rest
         spectrum_activity = self.decode(s_star)
         spectrum_restframe = baseline+spectrum_activity
         spectrum_observed = self.decoder.transform(spectrum_restframe, z, instrument=instrument)
-        if z_sky is None: spectrum_telluric = 1
-        else: spectrum_telluric = self.telluric(s_sky,z_sky,instrument)
-        spectrum_observed *= spectrum_telluric
 
         if self.normalize:
             c = self._normalization(x, spectrum_observed, w=w)
@@ -432,11 +452,10 @@ class SpectrumAutoencoder(BaseAutoencoder):
                  instrument,
                  wave_rest,
                  spec_rest=None,
-                 spec_telluric=None,
                  rv_estimator=None,
                  skymask=None,
                  n_latent=10,
-                 n_telluric=2,
+                 n_telluric=3,
                  n_aux=0,
                  n_hidden=(64, 256, 1024),
                  act=None,
@@ -448,12 +467,12 @@ class SpectrumAutoencoder(BaseAutoencoder):
         decoder = SpectrumDecoder(
             wave_rest,
             spec_rest,
-            (n_latent-n_telluric),
+            n_latent,
             n_hidden=n_hidden,
             act=act,
         )
 
-        telluric = TelluricModel(wave_rest,eigen_spectra=(1-spec_telluric),skymask=skymask,n_component=n_telluric)
+        telluric = TelluricModel(wave_rest,instrument,skymask=skymask,n_latent=n_telluric)
 
         if rv_estimator==None:
             rv_estimator = RVEstimator(instrument.wave_obs.shape,sizes = [20,40])

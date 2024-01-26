@@ -160,7 +160,7 @@ def detrend_polynomial(wavelength,intensity,deg=3):
     fitted_polynomial = np.polyval(ppoly,wavelength)
     return fitted_polynomial
 
-def prepare_spectrum(input_wave,obsname,divide_telluric=False,mask_telluric=False,store_telluric = True, detrend=True, n_micro=100):
+def prepare_spectrum(input_wave,obsname,divide_telluric=False,mask_telluric=False,store_telluric = True, detrend=False, n_micro=100):
     large_number = 1e6
     data,info_dict = read_multiple_order("%s/%s"%(datadir,obsname),order_value=order_value)
 

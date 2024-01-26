@@ -164,30 +164,44 @@ def _losses(model,
             sigma_s=1.0,
             fid=True,
             skipz=False,
+            telluric=True,
             mi=False):
 
     spec, w, ssbrv, ID = batch
 
     if template==None: template = 0
+    if telluric:
+        s_sky = model.telluric.encode(spec-template)
+        z_sky = 1e3*ssbrv/instrument.c
+        spectrum_telluric = model.telluric(s_sky,z_sky)
+    else: spectrum_telluric = 1
 
-    if fid: s = model.encode(spec-template)
+    spectrum_no_telluric = spec/spectrum_telluric
+
+    if fid: s = model.encode(spectrum_no_telluric-template)
     else: s = 0.0
 
     if skipz:
         rv = torch.zeros((len(spec),1),device=spec.device)
-    else:rv =  model.estimate_rv(spec-template)
+    else:rv =  model.estimate_rv(spectrum_no_telluric-template)
 
     z = (rv)/instrument.c
-
     fid_loss = sim_loss = flex_loss = 0
 
     if fid:
-        y_act, _, spectrum_observed = model._forward(spec, w, s, z, z_sky=(1e3*ssbrv/instrument.c))
-        fid_loss = model._loss(spec, w, spectrum_observed)
-        #flex_loss = slope*(y_act**2/(1.0)).sum()
+        y_act, _, spectrum_observed = model._forward(spectrum_no_telluric, w, s, z)
+        fid_loss = model._loss(spectrum_no_telluric, w, spectrum_observed)
+        flex_loss = slope*(y_act**2/(1.0)).sum()
         # explicitly suppress telluric region
-        flex_loss = (model.telluric.skymask*y_act**2/0.1**2).sum()
+        flex_loss += (model.telluric.skymask*y_act**2/0.1**2).sum()
         print("slope:",slope,"flex_loss:",flex_loss)
+        print("s:",s.min().item(),s.max().item())
+
+    # telluric training
+    if skipz and not fid:
+        spectrum_observed = model.decoder.spec_rest
+        fid_loss = model._loss(spectrum_no_telluric, w, spectrum_observed)
+        #flex_loss = ((spectrum_telluric-1.0)**2).sum()
 
     if similarity:
         sim_loss = similarity_restframe(instrument, model, s, slope=slope,sigma_s=sigma_s)
@@ -252,6 +266,14 @@ def update_rv_estimator(rvfile, models, instruments, name='rv_estimator'):
     short = lambda key: key.split(name+".")[1]
     rv_model = {short(key):val for key,val in rv_model.items() if name in key}
     for model in models: model.rv_estimator.load_state_dict(rv_model)
+    return models
+
+def update_telluric(updatefile, models, instruments, name='telluric'):
+    device = instruments[0].wave_obs.device
+    update_model = torch.load(updatefile, map_location=device)["model"][0]
+    short = lambda key: key.split(name+".")[1]
+    update_model = {short(key):val for key,val in update_model.items() if name in key}
+    for model in models: model.telluric.load_state_dict(update_model)
     return models
 
 def load_model(mainfile, models, instruments):
@@ -370,7 +392,6 @@ def train(models,
             print("RV estimator:",mode['rv'][which])
             for p in models[which].rv_estimator.parameters():
                 p.requires_grad = mode['rv'][which]
-
             for p in models[which].telluric.parameters():
                 p.requires_grad = True
 
@@ -472,6 +493,7 @@ if __name__ == "__main__":
     parser.add_argument("-l", "--batch_number", help="number of batches per epoch", type=int, default=None)
     parser.add_argument("-r", "--rate", help="learning rate", type=float, default=1e-3)
     parser.add_argument("-z", "--rv_file", help="rv estimator", type=str, default="None")
+    parser.add_argument("-sky", "--sky_file", help="telluric model", type=str, default="None")
     parser.add_argument("-it", "--iteration", help="number of interation", type=int, default=100000)
     parser.add_argument("-s", "--similarity", help="add similarity loss", action="store_true")
     parser.add_argument("-skipfid", "--skipfid", help="skip fidelity loss", action="store_true",default=False)
@@ -518,11 +540,11 @@ if __name__ == "__main__":
 
     # define training sequence
     FULL = {"data":[True],"encoder":[True],"rv":[True],
-            "decoder":True,"spec_rest":True}
+            "decoder":True,"spec_rest":False}
     train_sequence = prepare_train([FULL],niter=args.iteration)
 
     annealing_step = 100
-    ANNEAL_SCHEDULE = np.linspace(0.0,2.0,annealing_step)
+    ANNEAL_SCHEDULE = np.linspace(0.0,1.0,annealing_step)
     if args.verbose and args.similarity:
         print("similarity_slope:",len(ANNEAL_SCHEDULE),ANNEAL_SCHEDULE)
 
@@ -531,7 +553,6 @@ if __name__ == "__main__":
     models = [ SpectrumAutoencoder(instrument,
                                    wave_rest,
                                    spec_rest=init_restframe,
-                                   spec_telluric=telluric,
                                    skymask=skymask,
                                    n_latent=args.latents,
                                    n_hidden=n_hidden,
@@ -541,7 +562,7 @@ if __name__ == "__main__":
     #print("RVEstimator:",models[0].rv_estimator)
     print("Encoder: n_latent=%d"%models[0].encoder.n_latent)
     print("Decoder: n_latent=%d"%models[0].decoder.n_latent)
-    print("Telluric: n_component=%d"%models[0].telluric.n_component)
+    print("Telluric: n_latent=%d"%models[0].telluric.n_latent)
 
     # use same decoder
     if n_encoder==2:models[1].decoder = models[0].decoder
@@ -565,6 +586,9 @@ if __name__ == "__main__":
         if args.verbose:
             print("\nUpdating RV estimator based on file %s"%args.rv_file)
         models = update_rv_estimator(args.rv_file, models, instruments)
+    if os.path.isfile(args.sky_file):
+        print("\nUpdating telluric model based on file %s"%args.sky_file)
+        models = update_telluric(args.sky_file, models, instruments)
 
     profiler = LineProfiler()
     profiler.add_function(partial)
