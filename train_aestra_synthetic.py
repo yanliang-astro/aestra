@@ -85,7 +85,9 @@ def get_all_parameters(models,instruments):
     # 1 decoder
     model_params += model.decoder.parameters()
     # 1 telluric model
-    model_params += model.telluric.parameters()
+    if model.telluric is not None:model_params += model.telluric.parameters()
+    # 1 continuum model
+    model_params += model.continuum.parameters()
     dicts = [{'params':model_params}]
 
     n_parameters = sum([p.numel() for p in model_params if p.requires_grad])
@@ -164,44 +166,46 @@ def _losses(model,
             sigma_s=1.0,
             fid=True,
             skipz=False,
-            telluric=True,
             mi=False):
 
-    spec, w, ssbrv, ID = batch
+    spec, w, ssbrv, jd = batch
 
     if template==None: template = 0
-    if telluric:
+    if model.telluric is not None:
         s_sky = model.telluric.encode(spec-template)
         z_sky = 1e3*ssbrv/instrument.c
         spectrum_telluric = model.telluric(s_sky,z_sky)
     else: spectrum_telluric = 1
 
-    spectrum_no_telluric = spec/spectrum_telluric
-
-    if fid: s = model.encode(spectrum_no_telluric-template)
+    if fid: s = model.encode(spec-template)
     else: s = 0.0
 
     if skipz:
-        rv = torch.zeros((len(spec),1),device=spec.device)
-    else:rv =  model.estimate_rv(spectrum_no_telluric-template)
+        rv = torch.zeros((spec.shape[0],spec.shape[1]),device=spec.device)
+    else:rv =  model.estimate_rv(spec-template)
 
     z = (rv)/instrument.c
     fid_loss = sim_loss = flex_loss = 0
 
+    # stellar acitivity training
     if fid:
-        y_act, _, spectrum_observed = model._forward(spectrum_no_telluric, w, s, z)
-        fid_loss = model._loss(spectrum_no_telluric, w, spectrum_observed)
+        y_act, spectrum_restframe, spectrum_observed = model._forward(spec, w, s, z)
+        spectrum_trend = model.continuum.fit_trend(spec-template)
+        spectrum_observed *= spectrum_telluric
+        spectrum_observed *= (1.0+spectrum_trend)
+        fid_loss = model._loss(spec, w, spectrum_observed)
         flex_loss = slope*(y_act**2/(1.0)).sum()
-        # explicitly suppress telluric region
-        flex_loss += (model.telluric.skymask*y_act**2/0.1**2).sum()
         print("slope:",slope,"flex_loss:",flex_loss)
         print("s:",s.min().item(),s.max().item())
 
     # telluric training
     if skipz and not fid:
-        spectrum_observed = model.decoder.spec_rest
-        fid_loss = model._loss(spectrum_no_telluric, w, spectrum_observed)
-        #flex_loss = ((spectrum_telluric-1.0)**2).sum()
+        spec_rest = model.decoder.transform(model.decoder.spec_rest[None,:], 
+                                            z[[0]], instrument=instrument)
+        spectrum_observed = spectrum_telluric*spec_rest
+        spectrum_trend = model.continuum.fit_trend(spec-template)
+        spectrum_observed *= (1.0+spectrum_trend)
+        fid_loss = model._loss(spec, w, spectrum_observed)
 
     if similarity:
         sim_loss = similarity_restframe(instrument, model, s, slope=slope,sigma_s=sigma_s)
@@ -269,6 +273,10 @@ def update_rv_estimator(rvfile, models, instruments, name='rv_estimator'):
     return models
 
 def update_telluric(updatefile, models, instruments, name='telluric'):
+    if updatefile == "null":
+        print("No telluric model...")
+        for model in models: model.telluric = None
+        return models
     device = instruments[0].wave_obs.device
     update_model = torch.load(updatefile, map_location=device)["model"][0]
     short = lambda key: key.split(name+".")[1]
@@ -281,21 +289,13 @@ def load_model(mainfile, models, instruments):
     model_struct = torch.load(mainfile, map_location=device)
 
     for i, model in enumerate(models):
-        model.load_state_dict(model_struct['model'][i], strict=False)
+        model_dict = model_struct['model'][i]
+        #skip="continuum"
+        #model_dict = {key:val for key,val in model_dict.items() if not skip in key}
+        model.load_state_dict(model_dict, strict=False)
 
     losses = model_struct['losses']
     return models, losses
-
-def get_data_loader(datadir, select="mockdata",which="train",batch_size=1024,shuffle=True,double=False):
-    if which=="train":file = os.path.join(datadir,"%s.pkl"%select)
-    else: file = os.path.join(datadir,"%s_valid.pkl"%select)
-    print("file:",file, "double:",double)
-    data = load_batch(file)
-    if double:data = [item.double() for item in data]
-    else: data[:3] = [item.float() for item in data[:3]]
-    print("select:",select,"which:",which,"data:",data[0].shape)
-    dataset = torch.utils.data.TensorDataset(*data)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 def train(models,
           instruments,
@@ -393,8 +393,10 @@ def train(models,
             for p in models[which].rv_estimator.parameters():
                 p.requires_grad = mode['rv'][which]
             for p in models[which].telluric.parameters():
-                p.requires_grad = True
-
+                p.requires_grad = False
+            for p in models[which].continuum.parameters():
+                p.requires_grad = False
+            
             # optional: training on single dataset
             if not mode['data'][which]:
                 continue
@@ -425,6 +427,13 @@ def train(models,
                 accelerator.clip_grad_norm_(model_parameters[0]['params'], 1.0)
                 # once per batch
                 optimizer.step()
+
+                if models[which].telluric is not None and models[which].telluric.lsf is not None:
+                    # lsf weights are non-negative & sum to 1
+                    non_negative_weights = torch.clamp(models[which].telluric.lsf.weight.data, min=0)
+                    norm_weights = non_negative_weights / non_negative_weights.sum()
+                    models[which].telluric.lsf.weight.data = norm_weights
+
                 optimizer.zero_grad()
 
                 # logging: training
@@ -509,14 +518,10 @@ if __name__ == "__main__":
     wave_obs = load_batch("%s%s-wavelength.pkl"%(args.dir,args.data))
     telluric = load_batch("%s%s-telluric.pkl"%(args.dir,args.data))
     skymask = load_batch("%s%s-skymask.pkl"%(args.dir,args.data))
-    wave_rest = wave_obs
 
     # define instruments
     instruments = [ Synthetic(wave_obs) ]
     n_encoder = len(instruments)
-
-    # restframe wavelength for reconstructed spectra
-    #lmbda_min = 4999.0;lmbda_max = 5011.0;bins = 1200
 
     # data loaders
     trainloaders = [ inst.get_data_loader(args.dir, select=args.data, which="train",
@@ -525,11 +530,14 @@ if __name__ == "__main__":
 
     template_data = load_batch("%s%s-template.pkl"%(args.dir,args.data))
 
-
-    if args.init: init_restframe = load_batch("%s%s-rest.pkl"%(args.dir,args.data))[0]
+    if args.init: 
+        init_rest = load_batch("%s%s-rest.pkl"%(args.dir,args.data))
+        wave_rest = init_rest[0]
+        init_restframe = init_rest[1].float()
     else:
         #init_restframe = Interp1d()(wave_obs, template_data[0], wave_rest)
         init_restframe = (template_data[0]/telluric)
+        wave_rest = wave_obs
 
     if args.double:
         template_data = [item.double() for item in template_data]
@@ -540,7 +548,7 @@ if __name__ == "__main__":
 
     # define training sequence
     FULL = {"data":[True],"encoder":[True],"rv":[True],
-            "decoder":True,"spec_rest":False}
+            "decoder":True,"spec_rest":True}
     train_sequence = prepare_train([FULL],niter=args.iteration)
 
     annealing_step = 100
@@ -586,7 +594,7 @@ if __name__ == "__main__":
         if args.verbose:
             print("\nUpdating RV estimator based on file %s"%args.rv_file)
         models = update_rv_estimator(args.rv_file, models, instruments)
-    if os.path.isfile(args.sky_file):
+    if os.path.isfile(args.sky_file) or args.sky_file == "null":
         print("\nUpdating telluric model based on file %s"%args.sky_file)
         models = update_telluric(args.sky_file, models, instruments)
 
