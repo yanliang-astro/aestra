@@ -267,53 +267,6 @@ class CubicSplineContinuum(nn.Module):
         if not full:return yfit
         return yfit,ydata,y_compress,y_point
 
-class PolynomialContinuum(nn.Module):
-    def __init__(self,
-                 wave_obs,
-                 n_in = 1,
-                 deg=5,
-                 n_hidden=(4,128),
-                 act=None):
-        super(PolynomialContinuum, self).__init__()
-
-        n_channel,n_spec = wave_obs.shape
-        powers = torch.arange(deg + 1).unsqueeze(0)
-        X = torch.linspace(-1,1,n_spec).unsqueeze(1) ** powers
-        X_pinv = torch.pinverse(X)
-
-        self.n_coeff = deg+1
-        self.n_spec = n_spec
-        self.n_channel = n_channel
-        #self.mlp = MLP(n_in,self.n_coeff*n_channel,n_hidden=n_hidden)
-        self.register_buffer('X', X)
-        self.register_buffer('X_pinv', X_pinv)
-        #for p in self.mlp.parameters():torch.nn.init.normal_(p,std=1e-4)
-
-    def fit_trend(self,spec,spectrum_observed):
-        batch_size,n_order,n_spec = spec.shape
-        #return torch.ones_like(spec)
-        ydata = torch.ones_like(spec)
-        mask = spectrum_observed>0.1
-        ydata[mask] = spec[mask]/spectrum_observed[mask]
-        Y = ydata.reshape(batch_size*n_order,n_spec).T
-        coefficients = torch.matmul(self.X_pinv,Y)
-        yfit = (coefficients*self.X[:,:,None]).sum(dim=1).T
-        yfit = yfit.reshape((batch_size,n_order,n_spec))
-        return yfit
-
-    def forward(self,s):
-        return torch.ones((s.shape[0],self.n_channel,self.n_spec),device=s.device)
- 
-    def _forward(self,s):
-        coefficients = self.mlp(s[:,None])
-        batch_size, n_params = coefficients.shape
-        coefficients = coefficients.reshape((batch_size,self.n_channel,self.n_coeff))
-        powers = torch.arange(self.n_coeff-1, -1, -1, device=s.device)
-        poly_terms = self.X#self.xx[None,:,None].pow(powers)
-        y_continuum = torch.sum(coefficients.unsqueeze(2) * poly_terms, dim=3)
-        #y_continuum = self.max_c*self.act(y_continuum)
-        return 1+y_continuum
-
 class TelluricModel(nn.Module):
     def __init__(self,
                  wave_rest,
@@ -454,7 +407,7 @@ class SpectrumDecoder(MultipleMLP):
             spectrum_restframe=spectrum_restframe.squeeze(1)
         spectrum = torch.ones((n_batch,n_order,n_spec),device=z.device)
         for i in range(n_order):
-            wave_redshifted = - wave_obs[i] * z[:,[i]] + wave_obs[i]
+            wave_redshifted = - wave_obs[i] * z + wave_obs[i]
             mask = (xx>wave_redshifted.min())&(xx<wave_redshifted.max())
             spectrum[:,i,:] = cubic_transform(xx[mask], spectrum_restframe[:,mask], wave_redshifted)
         return spectrum

@@ -181,9 +181,10 @@ def _losses(model,
     else: s = 0.0
 
     if skipz:
-        rv = torch.zeros((spec.shape[0],spec.shape[1]),device=spec.device)
-    else:rv =  model.estimate_rv(spec-template)
-
+        rv = torch.zeros((spec.shape[0],1),device=spec.device)
+    else:rv =  model.estimate_rv(spec/spectrum_telluric-template)
+    print("rv:",rv.shape,rv.min().item(),rv.max().item())
+    #exit()
     z = (rv)/instrument.c
     fid_loss = sim_loss = flex_loss = 0
 
@@ -193,13 +194,24 @@ def _losses(model,
         spectrum_trend = model.continuum.fit_trend(spec-template)
         spectrum_observed *= spectrum_telluric
         spectrum_observed *= (1.0+spectrum_trend)
-        fid_loss = model._loss(spec, w, spectrum_observed)
-        flex_loss = slope*(y_act**2/(1.0)).sum()
-        print("slope:",slope,"flex_loss:",flex_loss)
-        print("s:",s.min().item(),s.max().item())
 
-    # telluric training
-    if skipz and not fid:
+        # inflate errorbars around telluric lines
+        if model.telluric is not None:
+            telluric_err = torch.zeros_like(spec)
+            mask = spectrum_telluric<1.0
+            telluric_err[mask] = 0.1*(1.0-spectrum_telluric[mask])
+            w_new = 1.0/(1.0/w+telluric_err**2)
+        else: w_new = w
+
+        fid_loss = model._loss(spec, w_new, spectrum_observed)
+        flex_loss = slope*(y_act**2/(1.0)).sum()
+        #print("slope:",slope,"spectrum_telluric:",
+        #      spectrum_telluric.min(),spectrum_telluric.max(),
+        #      "flex_loss:",flex_loss)
+        #print("s:",s.min().item(),s.max().item())
+
+    # telluric pre-training
+    if model.telluric is not None and skipz and not fid:
         spec_rest = model.decoder.transform(model.decoder.spec_rest[None,:], 
                                             z[[0]], instrument=instrument)
         spectrum_observed = spectrum_telluric*spec_rest
@@ -392,10 +404,11 @@ def train(models,
             print("RV estimator:",mode['rv'][which])
             for p in models[which].rv_estimator.parameters():
                 p.requires_grad = mode['rv'][which]
-            for p in models[which].telluric.parameters():
-                p.requires_grad = False
+            if models[which].telluric is not None:
+                for p in models[which].telluric.parameters():
+                    p.requires_grad = True
             for p in models[which].continuum.parameters():
-                p.requires_grad = False
+                p.requires_grad = True
             
             # optional: training on single dataset
             if not mode['data'][which]:
@@ -516,7 +529,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     wave_obs = load_batch("%s%s-wavelength.pkl"%(args.dir,args.data))
-    telluric = load_batch("%s%s-telluric.pkl"%(args.dir,args.data))
+    #telluric = load_batch("%s%s-telluric.pkl"%(args.dir,args.data))
     skymask = load_batch("%s%s-skymask.pkl"%(args.dir,args.data))
 
     # define instruments
@@ -536,7 +549,7 @@ if __name__ == "__main__":
         init_restframe = init_rest[1].float()
     else:
         #init_restframe = Interp1d()(wave_obs, template_data[0], wave_rest)
-        init_restframe = (template_data[0]/telluric)
+        init_restframe = template_data[0]
         wave_rest = wave_obs
 
     if args.double:
