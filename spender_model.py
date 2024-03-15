@@ -254,10 +254,10 @@ class CubicSplineContinuum(nn.Module):
 
     def fit_trend(self,spec_resid, full=False):
         batch_size,n_order,n_spec = spec_resid.shape
-        mask = ~self.skymask.repeat(batch_size,1,1) # remove lines
-        ydata = torch.zeros_like(spec_resid)
-        ydata[mask] = spec_resid[mask]
-        #ydata = spec_resid
+        #mask = ~self.skymask.repeat(batch_size,1,1) # remove lines
+        #ydata = torch.zeros_like(spec_resid)
+        #ydata[mask] = spec_resid[mask]
+        ydata = spec_resid
         y_compress = self.avg_pool(ydata)
         y_point = self.mlp(y_compress)
         yfit = torch.zeros_like(spec_resid)

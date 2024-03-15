@@ -71,8 +71,8 @@ class Synthetic(Instrument):
             batch = cls.make_batch(ids_)
             cls.save_batch(dir, batch, select, tag=tag, counter=counter)
 
-    def augment_spectra(self,batch,noise=True,ratio=0.20):
-        spec, w, _, ID = batch[:4]
+    def augment_spectra(self,batch,noise=True,ratio=0.50):
+        spec, w = batch[:2]
         batch_size, n_order, spec_size = spec.shape
         device = spec.device
         wave_obs = self.wave_obs#.to(device)
@@ -98,12 +98,12 @@ class Synthetic(Instrument):
         spec_new[out] = 1
 
         if noise:
-            sigma = w**(-0.5)
-            sigma[out] = 0
-            sigma[sigma>1] = 0
+            sigma = (w.mean())**(-0.5)
+            #sigma[sigma>1] = 0
             spec_noise = sigma*torch.normal(mean=0,std=1.0,size=spec.shape,
                                             device=device)
-            noise_mask = torch.rand(spec.shape).to(device)>ratio
-            spec_noise[noise_mask]=0
+            #noise_mask = torch.rand(spec.shape).to(device)>ratio
+            spec_noise[out|(w<1.0)]=0
+            #spec_noise[noise_mask]=0
             spec_new += spec_noise
-        return spec_new, 1, _, z_offset
+        return spec_new, z_offset

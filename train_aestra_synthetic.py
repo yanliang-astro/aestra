@@ -168,6 +168,8 @@ def _losses(model,
             skipz=False,
             mi=False):
 
+    fid_loss = sim_loss = flex_loss = 0
+
     spec, w, ssbrv, jd = batch
 
     if template==None: template = 0
@@ -177,21 +179,32 @@ def _losses(model,
         spectrum_telluric = model.telluric(s_sky,z_sky)
     else: spectrum_telluric = 1
 
-    if fid: s = model.encode(spec-template)
-    else: s = 0.0
+    # continuum correction
+    spectrum_trend = model.continuum.fit_trend(spec-template)
+    spec_ = spec/spectrum_telluric
 
     if skipz:
-        rv = torch.zeros((spec.shape[0],1),device=spec.device)
-    else:rv =  model.estimate_rv(spec/spectrum_telluric-template)
-    print("rv:",rv.shape,rv.min().item(),rv.max().item())
-    #exit()
-    z = (rv)/instrument.c
-    fid_loss = sim_loss = flex_loss = 0
+        z = torch.zeros((spec.shape[0],1),device=spec.device)
+        z_loss = 0
+    else:
+        rv =  model.estimate_rv(spec_-template)
+        z = (rv)/instrument.c
+        
+        flex_loss = slope*(rv**2/(10)**2).sum()
+
+        spec_aug,z_off_true = instrument.augment_spectra([spec_,w])
+        rv_aug = model.estimate_rv(spec_aug-template)
+        
+        z_off = (rv_aug - rv)/instrument.c
+        z_loss = z_offset_loss(z_off, z_off_true)
+        print("z_loss:",z_loss.item(),
+              "RV: %.2f, %.2f"%(rv.min().item(),rv.max().item()),
+              "RV_aug: %.2f, %.2f"%(rv_aug.min().item(),rv_aug.max().item()))
 
     # stellar acitivity training
     if fid:
-        y_act, spectrum_restframe, spectrum_observed = model._forward(spec, w, s, z)
-        spectrum_trend = model.continuum.fit_trend(spec-template)
+        s = model.encode(spec_-template)
+        y_act, spectrum_restframe, spectrum_observed = model._forward(spec_, w, s, z)
         spectrum_observed *= spectrum_telluric
         spectrum_observed *= (1.0+spectrum_trend)
 
@@ -204,11 +217,8 @@ def _losses(model,
         else: w_new = w
 
         fid_loss = model._loss(spec, w_new, spectrum_observed)
-        flex_loss = slope*(y_act**2/(1.0)).sum()
-        #print("slope:",slope,"spectrum_telluric:",
-        #      spectrum_telluric.min(),spectrum_telluric.max(),
-        #      "flex_loss:",flex_loss)
-        #print("s:",s.min().item(),s.max().item())
+        flex_loss += slope*(y_act**2/(1.0)).sum()
+    else: s = 0.0
 
     # telluric pre-training
     if model.telluric is not None and skipz and not fid:
@@ -223,7 +233,7 @@ def _losses(model,
         sim_loss = similarity_restframe(instrument, model, s, slope=slope,sigma_s=sigma_s)
     if mi:flex_loss = mutual_information(s,rv)*spec.shape[0]
 
-    return fid_loss, sim_loss, flex_loss, s, z
+    return fid_loss, sim_loss, flex_loss, s, z_loss
 
 def get_losses(model,
                instrument,
@@ -235,28 +245,13 @@ def get_losses(model,
                flexibility=True,
                slope=0,
                sigma_s=2,
-               zloss=True,
                skipfid=False,
                skipz=False
                ):
 
     zeropoint_loss = 0
 
-    loss,sim_loss,flex_loss,s,z = _losses(model, instrument, batch, similarity=similarity, slope=slope, sigma_s=sigma_s, fid=not skipfid,skipz=skipz,template=template)
-
-    if not skipz and (zloss or consistency):
-        batch_copy = aug_fct(batch)
-        fid_loss,_,_,s_,z_ = _losses(model, instrument,batch_copy, template=template,fid=False,skipz=skipz,similarity=False)
-        z_off = z_ - z
-        z_off_true = batch_copy[3]
-        #flex_loss = fid_loss
-
-    if not skipz and zloss:
-        z_loss = z_offset_loss(z_off, z_off_true)
-        print("z_loss:",z_loss.item(),
-              "RV: %.2f, %.2f"%(Synthetic.c*z.min(),
-                                Synthetic.c*z.max()))
-    else: z_loss = 0
+    loss,sim_loss,flex_loss,s,z_loss = _losses(model, instrument, batch, similarity=similarity, slope=slope, sigma_s=sigma_s, fid=not skipfid,skipz=skipz,template=template)
 
     if consistency and aug_fct is not None:
         cons_loss = consistency_loss(s, s_, sigma_s=sigma_s)
@@ -406,9 +401,10 @@ def train(models,
                 p.requires_grad = mode['rv'][which]
             if models[which].telluric is not None:
                 for p in models[which].telluric.parameters():
-                    p.requires_grad = True
+                    p.requires_grad = mode['telluric']
             for p in models[which].continuum.parameters():
-                p.requires_grad = True
+                p.requires_grad = mode['continuum']
+            print("Continuum:",mode['continuum'])
             
             # optional: training on single dataset
             if not mode['data'][which]:
@@ -524,6 +520,8 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--double", help="double precision", action="store_true",default=False)
     parser.add_argument("-init", "--init", help="initialize restframe", action="store_true",default=False)
     parser.add_argument("-f", "--flexibility", help="constrian model flexibility", action="store_true",default=False)
+    parser.add_argument("-continuum", "--continuum", help="train continuum model", action="store_true",default=False)
+    parser.add_argument("-telluric", "--telluric", help="train telluric model", action="store_true",default=False)
     parser.add_argument("-C", "--clobber", help="continue training of existing model", action="store_true")
     parser.add_argument("-v", "--verbose", help="verbose printing", action="store_true")
     args = parser.parse_args()
@@ -561,7 +559,8 @@ if __name__ == "__main__":
 
     # define training sequence
     FULL = {"data":[True],"encoder":[True],"rv":[True],
-            "decoder":True,"spec_rest":True}
+            "decoder":True,"spec_rest":True, 'telluric':args.telluric,
+            'continuum':args.continuum}
     train_sequence = prepare_train([FULL],niter=args.iteration)
 
     annealing_step = 100
