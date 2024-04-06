@@ -233,39 +233,40 @@ class SpectrumEncoder(nn.Module):
 class CubicSplineContinuum(nn.Module):
     def __init__(self,
                  wave_obs,
-                 n_in = 87,
+                 n_in = 2,
                  num_points=10,
-                 skymask=None,
-                 n_hidden=(16,16),
+                 n_hidden=(16,64,16),
                  act=None):
         super(CubicSplineContinuum, self).__init__()
         n_channel,n_spec = wave_obs.shape
-        X = torch.linspace(-1,1,n_spec)
         x_point = torch.linspace(-1,1,num_points)
         kernel_size = n_spec//n_in
         self.avg_pool = nn.AvgPool1d(kernel_size)
         self.mlp = ParallelMLP(n_in,num_points,
                                n_channel=n_channel,n_hidden=n_hidden)
-        self.register_buffer('skymask', skymask.bool())
-        self.register_buffer('X', X)
+
         self.register_buffer('x_point', x_point)
         for p in self.mlp.parameters():
             if p.dim()==1:torch.nn.init.normal_(p,std=1e-2)
 
-    def fit_trend(self,spec_resid, full=False):
-        batch_size,n_order,n_spec = spec_resid.shape
-        #mask = ~self.skymask.repeat(batch_size,1,1) # remove lines
-        #ydata = torch.zeros_like(spec_resid)
-        #ydata[mask] = spec_resid[mask]
-        ydata = spec_resid
-        y_compress = self.avg_pool(ydata)
-        y_point = self.mlp(y_compress)
-        yfit = torch.zeros_like(spec_resid)
-        x = self.X.repeat(batch_size,1)
-        for i in range(n_order):
-            yfit[:,i,:] = cubic_transform(self.x_point,y_point[:,i,:],x)
+    def fit_trend(self,jd, full=False,n_out=0):
+        batch_size,n_order,n_spec = n_out
+        device = jd.device
+        #ydata = spec_resid
+        #y_compress = self.avg_pool(ydata)
+        #feature = jd[:,None].repeat((1,n_order))
+        #dates = torch.round(feature)
+        #times = feature - dates
+        #y_compress = torch.zeros((batch_size,n_order,2),device=device)
+        #y_compress[:,:,0] = dates/400 # normalize dates..
+        #y_compress[:,:,1] = times
+        #y_point = self.mlp(y_compress)
+        
+        yfit = torch.zeros((batch_size,n_order,n_spec),device=device)
+        #x = torch.linspace(-1,1,n_spec,device=device).repeat(batch_size,1)
+        #for i in range(n_order):
+        #    yfit[:,i,:] = cubic_transform(self.x_point,y_point[:,i,:],x)
         if not full:return yfit
-        return yfit,ydata,y_compress,y_point
 
 class TelluricModel(nn.Module):
     def __init__(self,
@@ -289,7 +290,6 @@ class TelluricModel(nn.Module):
         else: 
             self.decoder = MultipleMLP(n_decoder,n_spec,n_channel=n_channel,n_hidden=())
         self.lsf = None
-        #self.lsf = nn.Conv1d(1, 1, 11, bias=False, padding='same')
         self.register_buffer('wave_rest', wave_rest)
         # initialize weights to avoid large fluctuation
         for p in self.decoder.parameters():torch.nn.init.normal_(p,std=1e-3)
@@ -331,10 +331,12 @@ class SpectrumDecoder(MultipleMLP):
                  wave_rest,
                  spec_rest,
                  n_latent=5,
+                 n_order=1,
                  n_hidden=(64, 256, 1024),
                  act=None,
                  dropout=0,
                  datatag="mockdata",
+                 lsf_size=31,
                 ):
         print("wave_rest:",wave_rest.shape,wave_rest.dim())
         if wave_rest.dim() == 1:
@@ -343,8 +345,6 @@ class SpectrumDecoder(MultipleMLP):
 
         if act==None: 
             act = [nn.LeakyReLU() for i in range(len(n_hidden)+1)]
-            #act = [SpeculatorActivation(n) for n in n_hidden]
-            #act.append(SpeculatorActivation(len(wave_rest)))
 
         super(SpectrumDecoder, self).__init__(
             n_latent,
@@ -358,7 +358,17 @@ class SpectrumDecoder(MultipleMLP):
         self.n_latent = n_latent
         #self.decode_act = nn.Identity()
         self.decode_act = nn.LeakyReLU()
-        # register wavelength tensors on the same device as the entire model
+
+        self.lsf = None
+        '''
+        self.lsf = nn.Conv1d(1, n_order, lsf_size, bias=False, padding='same',padding_mode="replicate")
+        sigma = torch.ones((n_order),device=wave_rest.device)*5
+        x_pix = torch.arange(-(lsf_size-1)//2,(lsf_size-1)//2+1,device=wave_rest.device)
+        x_sigma = x_pix[None,:]/sigma[:,None]
+        y_pix = torch.exp(-(x_sigma)**2/(2))
+        y_pix /= y_pix.sum(dim=1)[:,None]
+        self.lsf.weight.data=y_pix[:,None,:]
+        '''
         if spec_rest is None:
             self.spec_rest= torch.nn.Parameter(torch.randn(wave_rest.shape))
         else: self.spec_rest= torch.nn.Parameter(spec_rest.float())
@@ -366,50 +376,20 @@ class SpectrumDecoder(MultipleMLP):
 
     def decode(self, s):
         x = super().forward(s)
-        x = -self.decode_act(-x)
+        x = self.decode_act(x)
         return x
 
     def forward(self, s):
         return self.decode(s)
 
-    def _transform(self, spectrum_restframe, z, instrument=None):
+    def transform(self, spectrum_restframe, z, wave):
         xx = self.wave_rest
-
-        if instrument in [False, None]:
-            wave_obs = self.wave_rest
-        else:
-            wave_obs = instrument.wave_obs
-
-        n_order, n_spec = wave_obs.shape
-        batch_size = spectrum_restframe.shape[0]
-
-        spectrum = torch.zeros((batch_size,n_order, n_spec), device=wave_obs.device)
+        n_batch,n_order,n_spec = wave.shape
+        #spectrum_restframe=self.lsf(spectrum_restframe)
+        spectrum = torch.ones_like(wave)
         for i in range(n_order):
-            wave_redshifted = - wave_obs[i] * z + wave_obs[i]
+            wave_redshifted = - wave[:,i,:] * z[:,[i]] + wave[:,i,:]
             spectrum[:,i,:] = cubic_transform(xx[i], spectrum_restframe[:,i,:], wave_redshifted)
-
-        # convolve with LSF
-        if instrument.lsf is not None:
-            spectrum = instrument.lsf(spectrum.unsqueeze(1)).squeeze(1)
-
-        # apply calibration function to observed spectrum
-        if instrument is not None and instrument.calibration is not None:
-            spectrum = instrument.calibration(wave_obs, spectrum)
-
-        return spectrum
-
-    def transform(self, spectrum_restframe, z, instrument=None):
-        xx = self.wave_rest
-        wave_obs = instrument.wave_obs
-        n_order,n_spec = wave_obs.shape
-        n_batch = spectrum_restframe.shape[0]
-        if spectrum_restframe.shape[1]==1:
-            spectrum_restframe=spectrum_restframe.squeeze(1)
-        spectrum = torch.ones((n_batch,n_order,n_spec),device=z.device)
-        for i in range(n_order):
-            wave_redshifted = - wave_obs[i] * z + wave_obs[i]
-            mask = (xx>wave_redshifted.min())&(xx<wave_redshifted.max())
-            spectrum[:,i,:] = cubic_transform(xx[mask], spectrum_restframe[:,mask], wave_redshifted)
         return spectrum
 
     @property
@@ -447,7 +427,7 @@ class BaseAutoencoder(nn.Module):
         # estimate z
         return self.rv_estimator(x)
 
-    def _forward(self, x, w, s_star, z, instrument=None, aux=None):
+    def _forward(self, x, w, s_star, z, wave, instrument=None, aux=None):
         if w.dim()==1:w=w.unsqueeze(1)
 
         if instrument is None:
@@ -457,7 +437,7 @@ class BaseAutoencoder(nn.Module):
         else: baseline = self.decoder.spec_rest
         spectrum_activity = self.decode(s_star)
         spectrum_restframe = baseline+spectrum_activity
-        spectrum_observed = self.decoder.transform(spectrum_restframe, z, instrument=instrument)
+        spectrum_observed = self.decoder.transform(spectrum_restframe, z, wave)
 
         if self.normalize:
             c = self._normalization(x, spectrum_observed, w=w)
@@ -485,8 +465,9 @@ class BaseAutoencoder(nn.Module):
         loss_ind = torch.sum(w * (x - spectrum_observed).pow(2), dim=-1) / x.shape[-1]
         if individual:
             return loss_ind
-        loss_ind = torch.mean(loss_ind,dim=-1)
-        return torch.sum(loss_ind)
+        D = loss_ind.shape[1]# - 1
+        #loss_ind[:,1] = 0 # skip order 1 
+        return torch.sum(loss_ind) / D
 
     def _normalization(self, x, m, w=None):
         # apply constant factor c that minimizes (c*m - x)^2
@@ -529,12 +510,13 @@ class SpectrumAutoencoder(BaseAutoencoder):
             wave_rest,
             spec_rest,
             n_latent,
+            n_order=instrument.wave_obs.shape[0],
             n_hidden=n_hidden,
             act=act,
         )
 
         telluric = TelluricModel(wave_rest,instrument,n_decoder=n_telluric)
-        continuum = CubicSplineContinuum(instrument.wave_obs,skymask=skymask)
+        continuum = CubicSplineContinuum(instrument.wave_obs)
 
         if rv_estimator==None:
             rv_estimator = RVEstimator(instrument.wave_obs.shape,sizes = [20,40])

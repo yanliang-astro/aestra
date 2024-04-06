@@ -15,7 +15,8 @@ from astropy.io import fits
 from scipy.interpolate import interp1d,CubicSpline
 from scipy.special import gamma
 from synthetic_data import Synthetic
-from util import moving_mean,plot_fft,mem_report,load_batch
+from util import moving_mean,plot_fft,mem_report,load_batch,merge_batch
+from scipy.optimize import curve_fit
 
 dynamic_dir = "/scratch/gpfs/yanliang/neid-dynamic"
 datadir = "/scratch/gpfs/yanliang/NEID-SOLAR"
@@ -24,6 +25,20 @@ device =  torch.device("cpu")
 
 colors = ["k",'b','c','m','orange',"gold",'navy',"skyblue"]
 n_colors = len(colors)
+
+
+# Gaussian function
+def gaussian(x, amplitude, mean, stddev):
+    if stddev<0.01:return np.ones_like(x)
+    if amplitude>1:amplitude=1
+    return np.abs(amplitude) * np.exp(-((x - mean) ** 2) / (2 * stddev ** 2))
+
+# Function to fit multiple Gaussians
+def multi_gaussian(x, *params):
+    y = np.ones_like(x)
+    for i in range(0, len(params), 3):
+        y *= 1-(gaussian(x, params[i], params[i+1], params[i+2]))
+    return y
 
 def get_barycentric_corr_rv(header):
     # Initialize dictionaries to store the Barycentric Corrections
@@ -89,12 +104,15 @@ def read_multiple_order(filename,order_value,read_keys=['OBSJD','DATE-OBS']):
     info_dict["timestamp"] = np.float32(info_dict["OBSJD"] - 2459350.0) 
     return data,info_dict
 
-def redshift_chi(rv,wave_rest,yrest,wave_obs,ydata,wdata):
+def redshift_chi(rv,wave_rest,yrest,wrest,wave_obs,ydata,wdata):
     wave_shifted = wave_rest*(1 + rv/Synthetic.c)
-    func = CubicSpline(wave_shifted, yrest)
-    model_obs = func(wave_obs)
+    bad = yrest==0
+    model_obs = CubicSpline(wave_shifted[~bad], yrest[~bad])(wave_obs)
+    model_w = interp1d(wave_shifted,wrest)(wave_obs)
+
     wmodel = np.ones_like(wdata)
     wmodel[(wave_obs<min(wave_shifted))|(wave_obs>max(wave_shifted))]=0
+    wmodel[model_w<1.0]=0
     loss = np.sum(wmodel*wdata * (ydata - model_obs)**2) / len(ydata)
     return loss
 
@@ -120,7 +138,7 @@ def find_deepest_lines(wave_obs, raw_spectrum, num_lines=30, min_separation=0.10
     unique_depths = depth[unique_indices]
 
     # Return as a list of tuples sorted by depth
-    return sorted(zip(unique_wavelengths, unique_depths), key=lambda x: x[1], reverse=True)
+    return sorted(zip(unique_wavelengths, unique_depths), key=lambda x: x[0])
 
 def mask_deepest_lines(wave_obs, lines_to_mask, mask_width=0.15):
     # Copy the spectrum to avoid modifying the original
@@ -149,121 +167,66 @@ def calculate_flux_uncertainty(wave_obs, lines_to_mask, width=0.15):
         uncertainty = np.maximum(uncertainty, gaussian)
     return uncertainty
 
-def detrend_polynomial(wavelength,intensity,deg=3):
-    ysmooth = gaussian_filter1d(intensity, 30)
-    ydiff = intensity-ysmooth
-    # Calculate the 1D derivative of the spectrum
-    derivative = np.gradient(intensity, wavelength)
-    threshold = np.quantile(np.abs(derivative),0.5)
-    absorption = (np.abs(derivative)>threshold)|(ydiff<np.quantile(ydiff,0.3))
-    # Remove the absorption lines from the data
-    wavelength_no_absorption = wavelength[~absorption]
-    intensity_no_absorption = intensity[~absorption]
-    ppoly = np.polyfit(wavelength_no_absorption, intensity_no_absorption, deg)
-    fitted_polynomial = np.polyval(ppoly,wavelength)
-    return fitted_polynomial
 
-def prepare_spectrum(input_wave,obsname,mask_telluric=False,store_telluric=True,detrend=False,n_micro=100,repack=False):
+def prepare_spectrum(obsname):
     large_number = 1e6
-    try:
-        data,info_dict = read_multiple_order("%s/%s"%(datadir,obsname),order_value=order_value)
-    except:
-        print("obsname:",obsname)
-        exit()
-    if repack:
-        flag,telluric_model = load_telluric_model(obsname)
-        f_telluric = interp1d(wave_rest, telluric_model, kind='cubic')
-        store_telluric = False
+    data,info_dict = read_multiple_order("%s/%s"%(datadir,obsname),order_value=order_value)
+    
+    flag,telluric_model = load_telluric_model(obsname)
+    if flag: f_telluric = interp1d(wave_rest, telluric_model, kind='cubic')
 
-    n_spec = input_wave.shape[1]
-    spectrum = np.zeros((len(order_value),n_spec))
-    spectrum_err = np.zeros((len(order_value),n_spec))
-    if store_telluric: telluric_spectrum = np.zeros((len(order_value),n_spec))
+    wavelength = np.zeros((len(order_value),N_SPEC))
+    spectrum = np.zeros((len(order_value),N_SPEC))
+    spectrum_err = np.zeros((len(order_value),N_SPEC))
+    telluric_spectrum = np.zeros((len(order_value),N_SPEC))
     for k,o in enumerate(order_value):
         wave_obs = input_wave[k]
-        science,blaze,telluric = data[k]
+        science,blaze,neid_telluric = data[k]
         wave_raw,flux,flux_var = science
-        #print("NEID telluric:",telluric.min(),telluric.max())
-        # use our best telluric model
-        if repack:telluric = f_telluric(wave_raw)
 
+        #print("NEID telluric:",neid_telluric.min(),neid_telluric.max())
+        #print("AESTRA telluric:",telluric_model.min(),telluric_model.max())
         ssbrv = info_dict[o]["SSBRV"]
         jd = info_dict["OBSJD"]
-        ph,planetary_rv = simulate_planet(jd,amplitude_planet,period_planet)
-        info_dict["v_planet"] = planetary_rv
-        total_rv = 1e3*ssbrv + planetary_rv
-        # ssbrv: transform to heliocentric frame
-        wave = wave_raw + wave_raw*(total_rv)/Synthetic.c
-        isnan = np.isnan(flux) | np.isnan(blaze)| (blaze==0)
+
+        isnan = np.isnan(flux) | np.isnan(blaze)| (flux<=0.0)
 
         normflux = np.zeros_like(flux)
         normflux_err = np.zeros_like(flux_var)
 
-        if repack: denom = blaze*telluric
-        else: denom = blaze
+        denom = blaze
 
         norm = np.quantile(flux[~isnan]/denom[~isnan],0.5)
-        normflux[~isnan] = (flux[~isnan]/(norm*denom[~isnan]))
-        normflux_err[~isnan] = flux_var[~isnan]**0.5/(norm*denom)[~isnan]
-        # divide_telluric
-        #micro_tellurics = find_deepest_lines(wave, telluric, num_lines=n_micro)
-        #telluric_err = calculate_flux_uncertainty(wave_obs, micro_tellurics)
-
-        if np.isnan(blaze.min()):
-            print("blaze nan!",blaze.min(),blaze.max())
+        normflux[~isnan] = flux[~isnan]/(norm*denom[~isnan])
+        normflux_err[~isnan] = flux_var[~isnan]**0.5/(norm*denom[~isnan])
+        if normflux.min()<0:
+            print("negative flux!",normflux.min(),normflux.max())
         elif blaze.min()<=0.:
             print("blaze nan!",blaze.min(),blaze.max())
 
-        skymask = np.zeros(len(wave_obs),dtype=bool)
+        wavelength[k] = wave_raw
+        spectrum[k][~isnan] = normflux[~isnan]
+        spectrum_err[k][~isnan] = normflux_err[~isnan]
+        if flag: telluric_spectrum[k] = f_telluric(wave_raw)
+        elif neid_telluric.ndim ==1:
+            telluric_spectrum[k] = neid_telluric
+        # telluric lines * telluric continuum
+        else: telluric_spectrum[k] = neid_telluric[:,0]*neid_telluric[:,1]
+        spectrum_err[k][isnan] = large_number
+    data = wavelength,spectrum,spectrum_err,telluric_spectrum
+    return data,info_dict
 
-        wh_nan = np.where(isnan)[0]
-        index = np.where((wh_nan[1:]-wh_nan[:-1])>1)[0]
-        edges = [wh_nan[0]] + list(wh_nan[index]) + list(wh_nan[index+1]) + [wh_nan[-1]]
-        edges = wave[np.sort(edges)]
-
-        small = 1e-2
-        # select bad regions after interpolation
-        bad = (wave_obs<min(wave))|(wave_obs>max(wave))
-        for i_chunk in range(len(edges)//2):
-            start,end = edges[2*i_chunk:2*i_chunk+2]
-            bad |= (wave_obs>(start-small))&(wave_obs<(end+small))
-        #print("bad:",bad.sum())
-        inbound = (wave_obs>min(wave))&(wave_obs<max(wave))
-        locmask = inbound&(~bad)
-
-        # Interpolate flux onto wave_obs
-        spectrum[k][locmask] = interp1d(wave[~isnan], normflux[~isnan], kind='cubic')(wave_obs[locmask])
-        spectrum_err[k][locmask] = interp1d(wave[~isnan], normflux_err[~isnan], kind='cubic')(wave_obs[locmask])
-        spectrum_err[k][~locmask] = large_number
-        #if divide_telluric:
-        #combined_err = (spectrum_err[k]**2+telluric_err**2)**0.5
-        #spectrum_err[k][locmask] = combined_err[locmask]
-        #spectrum_err[k][skymask] = large_number
-        spectrum[k][~locmask] = 1.0
-        if store_telluric:
-            if telluric.ndim ==1:telluric_model = telluric
-            # telluric lines * telluric continuum
-            else: telluric_model = telluric[:,0]*telluric[:,1]
-            telluric_model/=np.quantile(telluric_model,0.5)
-            telluric_spectrum[k][inbound] = interp1d(wave, telluric_model, kind='cubic')(wave_obs[inbound])
-            telluric_spectrum[k][~inbound] = 1.0
-        else: telluric_spectrum = None
-        if detrend:
-            grad = np.abs(np.diff(spectrum[k],prepend=1.0))
-            cmask = locmask&(grad<np.quantile(grad,0.3))
-            cmask &= spectrum[k]>1.0
-            p = np.polyfit(wave_obs[cmask],spectrum[k][cmask],deg=1,w=spectrum_err[k][cmask])
-            spectrum_trend = np.polyval(p,wave_obs[locmask])
-            spectrum[k][locmask] /= spectrum_trend
-    return spectrum,spectrum_err,telluric_spectrum,info_dict
-
-def save_batch(specs,w,ssbrv,IDs,filename):
+def save_batch(wave,specs,w,ssbrv,IDs,telluric,filename):
+    wave = torch.from_numpy(wave.astype(np.double))
     spec = torch.from_numpy(specs.astype(np.float32))
-    w = torch.from_numpy(w.astype(np.float32))
+    weight = torch.from_numpy(w.astype(np.float32))
     ssbrv = torch.from_numpy(ssbrv.astype(np.double))
     ID = torch.from_numpy(IDs.astype(np.float32))
-    batch = [spec,w,ssbrv,ID]
-    print("spec:",spec.shape,"w:",w.shape,"ssbrv:",ssbrv,"ID",ID.shape)
+    telluric = torch.from_numpy(telluric.astype(np.float32))
+
+    batch = [wave,spec,weight,ssbrv,ID,telluric]
+    print("wave:",wave.shape,"spec:",spec.shape,"weight:",weight.shape,
+          "ssbrv:",ssbrv,"ID",ID.shape,"telluric",telluric.shape)
     print("saving to %s..."%filename)
     with open(filename, 'wb') as f:
         pickle.dump(batch, f)
@@ -277,33 +240,19 @@ def save_auxfile(input_data,filename):
         pickle.dump(input_data, f)
     return
 
-def merge_batch(file_batches):
-    spectra = [];weights = [];ssbrv = [];specid = []
-    for batchname in file_batches:
-        print("batchname:",batchname)
-        batch = load_batch(batchname)
-        spectra.append(batch[0])
-        weights.append(batch[1])
-        ssbrv.append(batch[2])
-        specid.append(batch[3])
-    spectra = torch.cat(spectra,axis=0)
-    weights = torch.cat(weights,axis=0)
-    ssbrv = torch.cat(ssbrv,axis=0)
-    specid = torch.cat(specid,axis=0)
-    print("spectra:",spectra.shape,"w:",weights.shape,
-          "ssbrv:",ssbrv.shape,"specid:",specid.shape)
-    return spectra, weights, ssbrv.T, specid
 
 def make_batch(sample_names):
     large_number = 1e6
     batch_size = len(sample_names)
-    specmat = np.ones((batch_size,n_order,n_spec))
-    errmat = np.zeros((batch_size,n_order,n_spec))
-    telluricmat = np.ones((batch_size,n_order,n_spec))
+    wavemat =  np.zeros((batch_size,n_order,N_SPEC))
+    specmat = np.zeros((batch_size,n_order,N_SPEC))
+    errmat = np.zeros((batch_size,n_order,N_SPEC))
+    telluricmat = np.ones((batch_size,n_order,N_SPEC))
     good =  np.ones((batch_size),dtype=bool)
     neid_dict = {}
     for i_obs,obsname in enumerate(sample_names):
-        spectrum,spectrum_err,telluric,info_dict = prepare_spectrum(input_wave,obsname,repack=args.repack)
+        data,info_dict = prepare_spectrum(obsname)
+        wavelength,spectrum,spectrum_err,telluric_spectrum = data
         # negative flux?
         neg = np.sum(spectrum<0.0,axis=-1)
         if neg.sum()>100:
@@ -313,35 +262,20 @@ def make_batch(sample_names):
         #if spectrum.min()<0.01:good[i_obs] = False
         if not good[i_obs]: continue
         neid_dict[obsname] = info_dict
+        wavemat[i_obs,:,:] = wavelength
         specmat[i_obs,:,:] = spectrum
         errmat[i_obs,:,:] = spectrum_err
-        if telluric is None:continue
-        telluricmat[i_obs,:,:] = telluric
+        telluricmat[i_obs,:,:] = telluric_spectrum
 
-    dispersion = np.std(specmat[good],axis=0)
-    whmax = np.argmax(dispersion,axis=-1)
-    for k in range(n_order):
-        while np.max(dispersion[k])>0.1:
-            avg_err = np.median(errmat[good,k,:],axis=0)
-            errmat[:,k,avg_err>1] = large_number
-            wh = whmax[k]
-            print("order %d dispersion = %.2f inflating errors..."%(k,dispersion[k][wh]))
-            errmat[:,k,wh-5:wh+5] = large_number
-            dispersion[k,wh-5:wh+5] = 0
-            whmax = np.argmax(dispersion,axis=-1)
-
-    avg_err = np.median(errmat[good],axis=0)[None,:,:]
-    w_baseline = (avg_err**(-2)).repeat(batch_size,axis=0)
-    baseline = np.median(specmat[good],axis=0)[None,:,:].repeat(batch_size,axis=0)
-    bad = (w_baseline<1e-3)|(errmat**(-2)<1e-3)
+    bad = errmat**(-2)<1.0
     print("bad pixels:",(bad.sum()/batch_size))
-    specmat[bad] = 1.0#baseline[bad]
+    print("good:",good.sum())
+    specmat[bad] = 0.0
+    wavemat=wavemat[good]
     specmat=specmat[good]
     errmat=errmat[good]
-    print("good:",good.sum())
-    if telluric is None:telluricmat=None
-    else:telluricmat=telluricmat[good]
-    return sample_names[good],specmat,errmat,telluricmat,neid_dict
+    telluricmat=telluricmat[good]
+    return sample_names[good],wavemat,specmat,errmat,telluricmat,neid_dict
 
 def photon_noise(spec_rest,wave_rest,sn):
     A0 = spec_rest*(sn**2)
@@ -353,8 +287,8 @@ def photon_noise(spec_rest,wave_rest,sn):
     RV_rms = Synthetic.c/(W.sum())**0.5
     return RV_rms
 
-def fit_rv(spec,w,rest_model,wave_obs):
-    result = scipy.optimize.minimize(redshift_chi,0.0, method='Nelder-Mead',args=(wave_obs,rest_model,wave_obs,spec,w,))
+def fit_rv(wave,spec,w,wave_rest,rest_model,weight_model):
+    result = scipy.optimize.minimize(redshift_chi,0.0, method='Nelder-Mead',args=(wave_rest,rest_model,weight_model,wave,spec,w,))
     label = "RV_fit=%.2f $\chi^2$:%.2f"%(result.x,result.fun)
     return result.x, result.fun, label
 
@@ -379,28 +313,25 @@ def velocity_label(velocity,label):
     return vlabel
 
 def make_batch_worker(batch_id, batch_name, neid_dict):
-    batch_id,specmat,errmat,telluricmat,sub_dict = make_batch(batch_id)
+    batch_id,wavemat,specmat,errmat,telluricmat,sub_dict = make_batch(batch_id)
     ssbrvs = get_timeseries(sub_dict,'SSBRV',batch_id).T
     timestamp = get_timeseries(sub_dict,'timestamp',batch_id)
-    save_batch(specmat,errmat**(-2),ssbrvs,timestamp,batch_name)
+    save_batch(wavemat,specmat,errmat**(-2),ssbrvs,timestamp,telluricmat,batch_name)
     print("good spectra: %d"%len(batch_id))
-    if not telluricmat is None:
-        auxname = "%s/%s-%s"%(dynamic_dir,"telluric",os.path.basename(batch_name))
-        save_auxfile(np.median(telluricmat,axis=0),auxname)
     neid_dict.update(sub_dict)
     return 0
 
-def fit_rv_worker(wave_obs,spec,w,baseline,mdict,obsname,order):
-    v_template,base_chi,message = fit_rv(spec,w,baseline,wave_obs)
+def fit_rv_worker(wave,spec,w,wave_baseline,baseline,baseline_w,mdict,obsname,order):
+    v_template,base_chi,message = fit_rv(wave,spec,w,wave_baseline,baseline,baseline_w)
     summary = {"v_template":v_template[0],"chi_template":base_chi}
     mdict["%s-%d"%(obsname,order)]=summary
     return 0
 
 def process_task(args, mdict):
     # Unpack arguments
-    wave_obs, specs, weights, baseline, obsname, order = args
+    wave, specs, weights, wave_baseline, baseline, baseline_w, obsname, order = args
     # Your existing task logic with the managed dictionary
-    fit_rv_worker(wave_obs, specs, weights, baseline, mdict, obsname, order)
+    fit_rv_worker(wave, specs, weights, wave_baseline, baseline, baseline_w, mdict, obsname, order)
     n_items = len(mdict)
     if n_items%500==0: print("mdict:",n_items)
     return
@@ -409,11 +340,10 @@ def wrap_data(sample_names,datatag,batch_size):
     idx = np.arange(0, len(sample_names), batch_size)
     batches = np.array_split(sample_names, idx[1:])
     file_batches = ["%s/%s_%d.pkl"%(dynamic_dir,datatag,k) for k in range(len(batches))]
-    planet_info = [amplitude_planet,period_planet,t0_value]
+
     general_info = {"sample_names":sample_names,
                     "files":file_batches,
-                    "orders":order_value,
-                    "planet_param":planet_info}
+                    "orders":order_value}
 
     process_list = []
     manager = mp.Manager()
@@ -437,15 +367,72 @@ def wrap_data(sample_names,datatag,batch_size):
 
     neid_dict = {k:v for k,v in mdict.items()}
     batch = merge_batch(file_batches)
-    specs,weights,ssbrvs,ids = [item.numpy() for item in batch]
-    baseline = np.median(specs,axis=0)
-    avg_err = np.median(weights**(-0.5),axis=0)
-    print("baseline:",baseline.shape)
+    waves,specs,weights,ssbrvs,ids,tellurics = [item.numpy() for item in batch]
     
+    # interpolate to homogeneous grid - calculate the template spectrum
+    print("native grid",waves.shape,"input grid",input_wave.shape)
+    n_template = min(100,len(specs))
+    n_order,n_pix = input_wave.shape
+    input_flux = np.zeros((n_template,n_order,n_pix))
+    input_weight = np.zeros((n_template,n_order,n_pix))
+    input_telluric = np.zeros((n_template,n_order,n_pix))
+    for o in range(n_order):
+        wave_obs = input_wave[o]
+        for i in range(n_template):
+            wave_raw = waves[i][o]
+
+            ssbrv = 1e3*ssbrvs[i][o] # km/s to m/s
+            flux = specs[i][o]
+            weight = weights[i][o]
+            telluric = tellurics[i][o]
+
+            wave = wave_raw + wave_raw*(ssbrv)/Synthetic.c
+            inbound = (wave_obs>min(wave))&(wave_obs<max(wave))
+            good = (weights[i][o]>1.0)
+
+            input_flux[i][o][inbound] = interp1d(wave[good], flux[good], kind='nearest')(wave_obs[inbound])
+            input_weight[i][o][inbound] = interp1d(wave, weight, kind='nearest')(wave_obs[inbound])
+            input_telluric[i][o][inbound] = interp1d(wave, telluric, kind='nearest')(wave_obs[inbound])
+            input_weight[i][o][~inbound] = 1e-12
+
+            bad = input_weight[i][o]<1.0
+            input_flux[i][o][bad] = 0.0
+            print(o,"raw spec min:",specs[i][o][good].min())
+            print(o,"spec min:",input_flux[i][o][~bad].min())
+
+    template = np.median(input_flux,axis=0)
+    template_w = np.median(input_weight,axis=0)
+    template_telluric = np.median(input_telluric,axis=0)
+
+    dispersion = np.std(input_flux,axis=0)
+    for o in range(n_order):
+        max_dispersion = np.max(dispersion[o])
+        while max_dispersion>0.1:
+            whmax = np.argmax(dispersion[o])
+            start,end = max(whmax-5,0),min(whmax+5,n_pix)
+            template_w[o][start:end] = 1e-12
+            dispersion[o][start:end] = 0
+            max_dispersion = np.max(dispersion[o])
+            print(o,max_dispersion,whmax)
+    template[template_w<1.0] = 0.0
+    dispersion[template_w<1.0] = 0.0
+
+    '''
+    fig,axs=plt.subplots(figsize=(10,8),nrows=n_order)
+    for o in range(n_order):
+        wave_obs = input_wave[o]
+        ax=axs[o]
+        ax.plot(wave_obs,template[o],"k-",lw=1)
+        ax.plot(wave_obs,dispersion[o],"r-",lw=1)
+    plt.savefig("test.png",dpi=200)
+    '''
     template_name="%s/%s.pkl"%(dynamic_dir,datatag+"-template")
-    save_batch(baseline[None,:,:],avg_err[None,:,:]**(-2),
-               np.array([0]),np.array([888]),template_name)
-    general_info.update({"baseline":baseline,"avg_err":avg_err})
+    save_batch(input_wave[None,:,:],
+               template[None,:,:],template_w[None,:,:],
+               np.array([0]),np.array([888]),
+               template_telluric[None,:,:],template_name)
+    general_info.update({"baseline":template,"baseline_w":template_w,
+                         "telluric_baseline":template_telluric})
     # remove poor-quality spectra
     sample_names = [i for i in sample_names if i in neid_dict]
     print("sample_names:",len(sample_names))
@@ -455,13 +442,6 @@ def wrap_data(sample_names,datatag,batch_size):
     with open("%s-param.pkl"%datatag,"wb") as f:
         pickle.dump(neid_dict,f)
 
-    if not args.repack:
-        telluric_batches = ["%s/telluric-%s_%d.pkl"%(dynamic_dir,datatag,k) for k in range(len(batches))]
-        telluric = []
-        for item in telluric_batches:
-            telluric.append(load_batch(item)[None,:,:])
-        telluric = torch.cat(telluric).mean(axis=0).numpy()
-        save_auxfile(telluric,"%s/%s-telluric.pkl"%(dynamic_dir,datatag))
     # calculate v_template and chi_template
     #process_list = []
     manager = mp.Manager()
@@ -473,7 +453,7 @@ def wrap_data(sample_names,datatag,batch_size):
     for i_epoch,obsname in enumerate(sample_names):
         for i_order,order in enumerate(order_value):
             wave_obs = input_wave[i_order]
-            task_args = (wave_obs, specs[i_epoch][i_order], weights[i_epoch][i_order], baseline[i_order], obsname, order)
+            task_args = (waves[i_epoch][i_order], specs[i_epoch][i_order], weights[i_epoch][i_order], input_wave[i_order],template[i_order],template_w[i_order], obsname, order)
             tasks.append(task_args)
 
     for i,task in enumerate(tasks):
@@ -522,7 +502,7 @@ def tensor2array(tensor):
         return tensor.detach().cpu().numpy()
     else: return tensor.detach().numpy()
 
-def load_telluric_model(obsname):
+def load_telluric_model(obsname,reftag="quiet_noplanet_N5000"):
     base = obsname.split(".")[0]
     fname = "%s/%s_%s_telluric.txt"%(telluric_dir,reftag,base)
     if os.path.isfile(fname):
@@ -531,36 +511,120 @@ def load_telluric_model(obsname):
     return False,None
             
 def preview_spectrum(input_wave,obsname,flag=False):
-    spectrum,spectrum_err,telluric,info_dict = prepare_spectrum(input_wave,obsname,repack=args.repack)
-    #flag,telluric_model = load_telluric_model(obsname)
+    data,info_dict = prepare_spectrum(obsname)
+    wavelength,spectrum,spectrum_err,telluric_spectrum = data
     nrows=len(order_value)
     fig, axs = plt.subplots(figsize=(12,nrows*2.5),nrows=nrows,dpi=200,constrained_layout=True)
     for i,ax in enumerate(axs):
         ax.set_title("Order %d"%order_value[i])
-        ax.plot(input_wave[i],spectrum[i],"k-")
-        if telluric is not None:ax.plot(input_wave[i],telluric[i],"b-")
-        if not flag: continue
-        ax.plot(wave_rest,telluric_model,"r-",lw=1,label="our telluric model")
+        ax.plot(wavelength[i],spectrum[i],"k-")
+        ax.plot(wavelength[i],telluric_spectrum[i],"r-",lw=1,label="our telluric model")
         ax.set_xlim(input_wave[i][0],input_wave[i][-1])
         ax.legend()
         #ax.set_ylim(0.9,1.01)
     plt.savefig("[%s]single-obs.png"%datatag)
     return
 
-def initialize_restframe_model(input_wave,baseline,telluric_spec):
+def initialize_restframe_model(input_wave,telluric_corrected,weight):
     # define restframe grids
     min_sep = np.min(input_wave[:,1:]-input_wave[:,:-1])
     wbin = min(min_sep,0.01) # wavelength bin
     wave_rest = np.arange(input_wave.min(),input_wave.max()+wbin,wbin)
     spec_rest = np.ones_like(wave_rest)
 
-    x = input_wave.reshape((n_order*n_spec))
-    y = (baseline/telluric_spec).reshape((n_order*n_spec))
-    bad = (baseline.reshape((n_order*n_spec))==1) | (y>1)
+    n_expand = input_wave.shape[0]*input_wave.shape[1]
+    x = input_wave.reshape((n_expand))
+    y = telluric_corrected.reshape((n_expand))
+    bad = (weight<1.0).reshape((n_expand))
     f = interp1d(x[~bad],y[~bad],kind = "nearest")
     mask = (wave_rest>x[~bad].min())&(wave_rest<x[~bad].max())
     spec_rest[mask] = f(wave_rest[mask])
-    init_rest = np.array([wave_rest,spec_rest])
+
+    num_lines = 500
+    lines_per_group = 50
+    dim = 3
+
+    '''
+    lines = find_deepest_lines(wave_rest, spec_rest, num_lines=num_lines,min_separation=0.10)
+    lines = np.array(lines)
+    param_fit = np.array([(line[1], line[0], 0.04) for line in lines])
+    print("param_fit:",param_fit.shape)
+
+    for i in range(num_lines//lines_per_group):
+        start,end = max(0,i*lines_per_group-5),min(num_lines,(i+1)*lines_per_group+5)
+        adjust = np.zeros((num_lines),dtype=bool)
+        fixed = np.zeros((num_lines),dtype=bool)
+        adjust[start:end] = True
+        fixed[start-3:start] = True
+        fixed[end:end+3] = True
+        wavemin,wavemax = lines[adjust,0].min(),lines[adjust,0].max()
+        mask = (wave_rest>wavemin)&(wave_rest<wavemax)
+
+        fixed_params = param_fit[fixed].reshape((fixed.sum()*dim))
+        fixed_spec = multi_gaussian(wave_rest[mask], *fixed_params)
+
+        p0 = param_fit[adjust].reshape((1,(adjust).sum()*dim))
+        params, covariance = curve_fit(multi_gaussian, wave_rest[mask], spec_rest[mask]/fixed_spec, p0=p0)
+        bestfit_model = multi_gaussian(wave_rest[mask], *params)
+        param_fit[adjust] = params.reshape(((adjust).sum(),dim))
+
+        chi = ((spec_rest[mask]/fixed_spec-bestfit_model)**2/0.01**2).mean()
+        print("lines %d ~ %d chi: %.2f"%(start,end,chi))
+        #plt.plot(wave_rest[mask],spec_rest[mask],"k-")
+        #plt.plot(wave_rest[mask],fixed_spec,"b-",lw=0.5)
+        #plt.plot(wave_rest[mask],bestfit_model,"r-",lw=0.5)
+        #plt.savefig("test.png",dpi=300)
+        #exit()
+
+    #with open("[lsf]bestfit.pkl","wb") as f:
+    #    pickle.dump(param_fit,f)
+    '''
+    from scipy.signal import convolve
+    with open("[lsf]bestfit.pkl","rb") as f:
+        param_fit = pickle.load(f)
+
+    lsf_size = 30
+    sigma = 5
+    x_sigma = np.arange(-lsf_size//2,lsf_size//2+1)/sigma
+    kernel = np.exp(-(x_sigma)**2/(2))
+    kernel /= kernel.sum()
+
+    width = 0.03 # about the same as stellar intrinsic lsf
+    '''
+    bitwise = np.ones_like(wave_rest)
+    for param in param_fit:
+        amp,mu,sig = param
+        mask = (wave_rest>(mu-width))&(wave_rest<(mu+width))
+        bitwise[mask] *= (1-amp*sig/width)
+    stellar = 1-bitwise
+    '''
+    thin = np.copy(param_fit)
+    thin[:,0] *= thin[:,2]/width
+    thin[:,2] = 0.03
+
+    param_fit = param_fit.reshape((num_lines*dim))
+    # Flatten the initial guess list for curve_fit
+    bestfit_model = multi_gaussian(wave_rest, *param_fit)
+    stellar = multi_gaussian(wave_rest, *thin.reshape((num_lines*dim)))
+    chi = ((spec_rest-bestfit_model)**2/0.01**2).mean()
+    print("bestfit_model chi:",chi)
+
+    intrinsic_model = 1-convolve(1-stellar, kernel, mode='same')
+    chi = ((spec_rest-intrinsic_model)**2/0.01**2).mean()
+    print("intrinsic_model chi:",chi)
+    
+    plt.plot(wave_rest,spec_rest,"k-",label="data")
+    plt.plot(wave_rest,bestfit_model,"r-",lw=0.5,label="Gaussian")
+    plt.plot(wave_rest,stellar,"-",lw=0.5,color="springgreen",
+             label="stellar intrinsic")
+    plt.plot(wave_rest,intrinsic_model,color="b",lw=0.5,
+             label="convolved with LSF")
+    plt.xlim(4981,4986)
+    plt.legend()
+    plt.ylim(0,1.1)
+    plt.savefig("test.png",dpi=300)
+
+    init_rest = np.array([wave_rest,stellar])
     print("init_rest:",init_rest.shape)
     return init_rest
 
@@ -571,15 +635,11 @@ torch.manual_seed(0)
 parser = argparse.ArgumentParser(description='Description of your script')
 
 # Define optional arguments with default values
-parser.add_argument('-t', '--tag', help='Tag description', default='single')
-parser.add_argument('-a', '--amplitude', type=float, help='Amplitude of the planet', default=0.0)
-parser.add_argument('-p', '--period', type=float, help='Period of the planet', default=0.11)
-parser.add_argument('-t0', '--t0_value', type=int, help='t0 value', default=2459300)
+parser.add_argument('-t', '--tag', help='Tag description', default='test')
 parser.add_argument('-n', '--samples', type=int, help='Number of samples', default=100)
 parser.add_argument('-batch', '--batch_size', type=int, help='Batch size', default=500)
 parser.add_argument('-cpu', '--num_cores', type=int, help='Number of CPU cores', default=10)
 parser.add_argument('-load', '--load_data', action='store_true', help='Load data')
-parser.add_argument('-r', '--repack', action='store_true', help='Repack data based on pretrained model')
 parser.add_argument('-o','--orders', nargs='+', help='<Required> Orders', required=True)
 
 # Parse the command-line arguments
@@ -587,28 +647,24 @@ args = parser.parse_args()
 
 # Access the values of the arguments
 tag = args.tag
-#order_value = args.order_value
-amplitude_planet = args.amplitude
-period_planet = args.period
-t0_value = args.t0_value
 n_sample = args.samples
 batch_size = args.batch_size
 num_cores = args.num_cores
 load_data = args.load_data
+
+N_SPEC = 9216
 
 order_value = [int(o) for o in args.orders]
 
 input_wave = [get_order_wavelengths(o) for o in order_value]
 input_wave = np.array(input_wave)
 
-n_order,n_spec = input_wave.shape
+n_order = len(order_value)
 print("input_wave:",input_wave.shape)
 
-if amplitude_planet>0:
-    per_tag = "%.2fday"%period_planet
-    amp_tag = "%dcm"%(amplitude_planet*100)
-    datatag = "%s_%s_%s_N%d"%(tag,per_tag,amp_tag,n_sample)
-else:datatag = "%s_noplanet_N%d"%(tag,n_sample)
+wave_rest = np.loadtxt("%s/quiet_wave_rest.txt"%(telluric_dir))
+
+datatag = "%s_N%d"%(tag,n_sample)
 
 # reading the CSV file
 csvfilename = 'NEID_2021B.csv'
@@ -665,20 +721,7 @@ batches = np.array_split(sample_names, idx[1:])
 file_batches = ["%s/%s_%d.pkl"%(dynamic_dir,datatag,k) for k in range(len(batches))]
 print("file_batches:",file_batches)
 
-if args.repack:
-    wave_rest = np.loadtxt("%s/%s_wave_rest.txt"%(telluric_dir,tag))
-    print("wave_rest:",wave_rest.shape)
-
-    aux_files = ["wavelength","skymask","template","rest"]
-    for aux in aux_files:
-        reftag = "%s_noplanet_N%d"%(tag,n_sample)
-        oldname = "%s-%s.pkl"%(reftag,aux)
-        auxname = "%s-%s.pkl"%(datatag,aux)
-        cmd="cp %s/%s %s/%s"%(dynamic_dir,oldname,dynamic_dir,auxname)
-        os.system(cmd)
-        print(cmd)
-
-preview_spectrum(input_wave,"neidL2_20211223T165223.fits")
+#preview_spectrum(input_wave,"neidL2_20211223T165223.fits")
 
 if not load_data:
     save_auxfile(input_wave,"%s/%s-wavelength.pkl"%(dynamic_dir,datatag))
@@ -693,46 +736,25 @@ print("neid_dict:",len(neid_dict))
 sample_names = neid_dict["info"]["sample_names"]
 print("good spectra: %d/%d"%(len(sample_names),len(sel)))
 
-# load generated data
-batch = merge_batch(file_batches)
-specs,weights,ssbrvs,ids = [item.numpy() for item in batch]
-n_epoch,n_order,n_spec = specs.shape
+telluric_baseline = neid_dict["info"]["telluric_baseline"]
+baseline = neid_dict["info"]["baseline"]
+baseline_w = neid_dict["info"]["baseline_w"]
 
-baseline = np.median(specs,axis=0)
-avg_err = np.median(weights**(-0.5),axis=0)
-dispersion = np.std(specs,axis=0)
-    
-if not args.repack:
-    save_telluric = "%s/%s-telluric.pkl"%(dynamic_dir,datatag)
-    telluric_spec = load_batch(save_telluric).numpy()
-    print("wave",input_wave.shape,
-          "telluric_spec:",telluric_spec.shape)
-    init_rest = initialize_restframe_model(input_wave,baseline,telluric_spec)
-    save_auxfile(init_rest,"%s/%s-rest.pkl"%(dynamic_dir,datatag))
-    skymask = np.zeros((baseline).shape,dtype=bool)
-    for i_order,o in enumerate(order_value):
-        wave_obs = input_wave[i_order]
-        top_unique_lines = find_deepest_lines(wave_obs, baseline[i_order],
-                                             num_lines=400)
-        # Mask the top unique deepest lines in the spectrum
-        skymask[i_order] = mask_deepest_lines(wave_obs, top_unique_lines)
-        fraction = skymask[i_order].sum()/len(wave_obs)
-        print("Order %d"%o,fraction)
-    save_auxfile(skymask,"%s/%s-skymask.pkl"%(dynamic_dir,datatag))
-
-    nrows=len(order_value)
-    fig, axs = plt.subplots(figsize=(12,nrows*2.5),nrows=nrows,dpi=200,constrained_layout=True)
-    for i,ax in enumerate(axs):
-        ax.set_title("Order %d"%order_value[i])
-        ax.plot(input_wave[i],baseline[i],"k-",label="mean")
-        ax.plot(input_wave[i],telluric_spec[i],"b-",label="mean tellurics")
-        ax.plot(input_wave[i],dispersion[i],"r-",lw=1, label="flux dispersion")
-        ax.legend()
-    plt.savefig("[%s]single-obs.png"%datatag)
+#init_rest = initialize_restframe_model(input_wave,baseline/telluric_baseline,baseline_w)
+#save_auxfile(init_rest,"%s/%s-rest.pkl"%(dynamic_dir,datatag))
+#exit()
+nrows=len(order_value)
+fig, axs = plt.subplots(figsize=(12,nrows*2.5),nrows=nrows,dpi=200,constrained_layout=True)
+for i,ax in enumerate(axs):
+    ax.set_title("Order %d"%order_value[i])
+    ax.plot(input_wave[i],baseline[i],"k-",label="mean")
+    ax.plot(input_wave[i],telluric_baseline[i],"b-",label="mean tellurics")
+    ax.legend()
+plt.savefig("[%s]single-obs.png"%datatag)
 
 
 for i_order,o in enumerate(order_value):
-    sn = baseline[i_order]/avg_err[i_order]
+    sn = baseline[i_order]/baseline_w[i_order]**(-0.5)
     print("sn:",sn.min(),sn.max(),"mean sn:",sn.mean())
     good = sn>1
     RV_limit = photon_noise(baseline[i_order][good],
@@ -752,9 +774,8 @@ bervs_order = -ssbrvs_order
 
 berv_norm = (bervs_order-np.median(bervs_order,axis=-1,keepdims=True))
 ccf_norm = (ccfrvs_order-np.median(ccfrvs_order,axis=-1,keepdims=True))
-v_template = v_template_order-np.median(v_template_order,axis=-1,keepdims=True)
 
-template_ccf_offset = v_template_order-ccf_norm
+template_ccf_offset = v_template_order-bervs_order-ccf_norm
 
 def print_string(vname,v,mode="1"):
     if mode=="1":
@@ -769,15 +790,17 @@ for i in range(n_order):
     print("\nOrder %d:"%order_value[i])
     print_string("base_chi",base_chi_order[i])
     print_string("$v_{CCF}$",ccf_norm[i],mode="2")
-    print_string("$v_{template}$",v_template[i],mode="2")
-    print_string("$v_{template}-v_{CCF}$",
+    print_string("$v_{template}-v_{ssb}$",(v_template_order[i]+ssbrvs_order[i]),mode="2")
+    print_string("$v_{template}-v_{ssb}-v_{CCF}$",
                  template_ccf_offset[i],mode="2")
 
-phase,v_planet = simulate_planet(jds,amplitude_planet,period_planet)
-
+v_template = v_template_order-bervs_order
+v_template -= np.median(v_template,axis=-1,keepdims=True)
 #plot_fft(timestamp,[v_template],datatag,["$v_{template}$"],
 #         period=period_planet,fs=14)
-
+Period = 88.3
+phase = (timestamp/Period)%1
+v_planet = np.zeros_like(phase)
 fig,ax=plt.subplots(figsize=(4,4),constrained_layout=True)
 for i in range(n_order):
     label_template = velocity_label((v_template[i]-v_planet),"$v_{template}-v_{planet}$")
@@ -793,19 +816,46 @@ ax.set_ylim(-1.5,1.5)
 ax.legend()
 plt.savefig("[%s]v_template-phase-fold.png"%datatag,dpi=300)
 
-rank = np.argsort(base_chi_order.mean(axis=0))[::-1]
+# load generated data
+batch = merge_batch(file_batches)
+waves,spec_raw,weights,ssbrvs,ids,telluric_spec = [item.numpy() for item in batch]
+specs = spec_raw/telluric_spec
+n_epoch,n_order,N_SPEC = specs.shape
+
+n_cut = 10
+
+cut_params = ssbrvs.mean(axis=1)
+cuts = np.linspace(cut_params.min(),cut_params.max(),n_cut)
+print("cuts:",cuts)
+dispersion = np.zeros((n_cut-1,n_order,N_SPEC))
+for i in range(n_cut-1):
+    who = (cut_params>cuts[i])&(cut_params<cuts[i+1])
+    dispersion[i] = np.std(specs[who],axis=0)
+print("dispersion:",dispersion.shape)
+dispersion = np.median(dispersion,axis=0)
+#rank = np.argsort(base_chi_order.mean(axis=0))[::-1]
 #i_plots = [0,1,2,3,4,5]#
+rank = np.argsort(ssbrvs.mean(axis=0))
 i_plots = rank[:5]
+
+baseline = np.median(specs,axis=0)
+baseline_w = np.median(weights,axis=0)
+spec_resid = specs - baseline[None,:,:]
+
+for o in range(n_order):
+    max_dispersion = np.max(dispersion[o])
+    whmax = np.argmax(dispersion[o])
+    print("order",o,"max_dispersion:",
+          max_dispersion,"where:",whmax)
 
 cmap = get_cmap('plasma_r')
 tmin,tmax = min(timestamp[i_plots]),max(timestamp[i_plots])
 colors =[cmap((t-tmin)/(tmax-tmin)) for t in timestamp[i_plots]]
 
-spec_resid = specs - baseline
 
 #wh = np.argmax(spec_resid[i_obs][i_order].abs())
-#mask = np.arange(280,350)
-mask = np.arange(0,n_spec)
+mask = np.arange(230,350)
+#mask = np.arange(0,N_SPEC)
         
 for i_order,o in enumerate(order_value):
     wave_obs = input_wave[i_order]
@@ -853,8 +903,9 @@ for i_order,o in enumerate(order_value):
 
     axs[0].plot(wave_obs[mask], spec_base[mask],drawstyle="steps-mid",lw=1,c="k",label="mean")
     axs[0].plot(wave_obs[mask], dispersion[i_order][mask],drawstyle="steps-mid",lw=1,c="r",label="dispersion")
+    #axs[0].plot(wave_obs[mask], dispersion[i_order][mask],drawstyle="steps-mid",lw=1,c="r",label="dispersion")
     axs[0].set_ylabel("normalized flux")
-    axs[1].set_ylabel("$v_{CCF}$ [m/s]")
+    #axs[1].set_ylabel("$v_{CCF}$ [m/s]")
     #axs[1].set_ylim(0.1,1.05)
     axs[0].legend()
     axs[0].set_title("Order %d"%o)

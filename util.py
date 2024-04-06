@@ -14,6 +14,72 @@ from torchinterp1d import Interp1d
 from torchcubicspline import natural_cubic_spline_coeffs
 from astropy.timeseries import LombScargle
 
+def interpolate_to_input_grid(batch,instrument,template_data,spectrum_trend,aug=False,planetary_rv=0):
+    wave_raw,spec_raw,w_raw,ssbrv,jd,telluric_spec = batch
+    wave_obs = instrument.wave_obs
+    n_order,n_spec = wave_obs.shape
+    n_batch = spec_raw.shape[0]
+    device = wave_obs.device
+
+    # produce augmentation data -- inject rv offset
+    if aug:
+        z_lim = 5e-8 # 15 m/s
+        z_offset = z_lim*(torch.rand(n_batch,1, device=device)-0.5)
+    else: z_offset = 0
+
+    template_w = template_data[2]
+    # remove tellurics and continuum
+    spec = spec_raw#/(telluric_spec*(spectrum_trend+1))    
+
+    # total rv = ssbrv + injected planetary_rv + rv offset
+    z = (ssbrv*1e3+planetary_rv)/instrument.c + z_offset
+
+    spectrum = torch.zeros((n_batch,n_order,n_spec),device=device)
+    #w = torch.zeros((n_batch,n_order,n_spec),device=device)
+    wave = wave_raw + wave_raw * z[:,:,None]
+
+    out = torch.zeros_like(spectrum,dtype=bool)
+    for i in range(n_order):
+        spectrum[:,i,:] = Interp1d()(wave[:,i,:], spec[:,i,:], wave_obs[i])
+        #if not aug:w[:,i,:] = Interp1d()(wave[:,i,:], w_raw[:,i,:], wave_obs[i])
+        wmin = wave[:,i,:].min(dim=1)[0]
+        wmax = wave[:,i,:].max(dim=1)[0]
+        out_ = (wave_obs[i]<wmin.unsqueeze(1))|(wave_obs[i]>wmax.unsqueeze(1))
+        out[:,i,:] = out_
+    ill = (template_w<1)
+    spectrum[ill|out] = 0
+    if aug:
+        sigma = (w_raw.mean())**(-0.5)
+        spec_noise = sigma*torch.normal(mean=0,std=1.0,size=spectrum.shape,
+                                        device=device)
+        spec_noise[ill|out]=0
+        spectrum += spec_noise
+    return spectrum, z_offset
+
+
+def merge_batch(file_batches):
+    waves = [];spectra = [];weights = []
+    ssbrv = [];specid = [];telluric = []
+    for batchname in file_batches:
+        print("batchname:",batchname)
+        batch = load_batch(batchname)
+        waves.append(batch[0])
+        spectra.append(batch[1])
+        weights.append(batch[2])
+        ssbrv.append(batch[3])
+        specid.append(batch[4])
+        telluric.append(batch[5])
+    waves =  torch.cat(waves,axis=0)
+    spectra = torch.cat(spectra,axis=0)
+    weights = torch.cat(weights,axis=0)
+    ssbrv = torch.cat(ssbrv,axis=0)
+    specid = torch.cat(specid,axis=0)
+    telluric = torch.cat(telluric,axis=0)
+    print("waves:",waves.shape,"spectra:",spectra.shape,
+          "w:",weights.shape,"ssbrv:",ssbrv.shape,
+          "specid:",specid.shape,"telluric:",telluric.shape)
+    return waves,spectra, weights, ssbrv, specid,telluric
+
 def cubic_evaluate(coeffs, tnew):
     t = coeffs[0]
     a,b,c,d = [item.squeeze(-1) for item in coeffs[1:]]
