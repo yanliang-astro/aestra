@@ -24,7 +24,7 @@ class Synthetic(Instrument):
         files = cls.list_batches(dir, select=select, 
                                  which=which, tag=tag)
         if which in ["train", "valid"]:
-            subset = slice(0,4)
+            subset = slice(0,6)
         else:
             subset = None
         load_fct = partial(load_batch, subset=subset)

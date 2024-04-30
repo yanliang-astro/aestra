@@ -23,7 +23,6 @@ class BaseInstrument(nn.Module):
 
         # register wavelength tensors on the same device as the entire model
         self.register_buffer('wave_obs', wave_obs)
-        self.register_buffer('skyline_mask', skylines_mask(wave_obs))
 
     @property
     def name(self):

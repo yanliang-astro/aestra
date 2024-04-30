@@ -252,20 +252,7 @@ class CubicSplineContinuum(nn.Module):
     def fit_trend(self,jd, full=False,n_out=0):
         batch_size,n_order,n_spec = n_out
         device = jd.device
-        #ydata = spec_resid
-        #y_compress = self.avg_pool(ydata)
-        #feature = jd[:,None].repeat((1,n_order))
-        #dates = torch.round(feature)
-        #times = feature - dates
-        #y_compress = torch.zeros((batch_size,n_order,2),device=device)
-        #y_compress[:,:,0] = dates/400 # normalize dates..
-        #y_compress[:,:,1] = times
-        #y_point = self.mlp(y_compress)
-        
         yfit = torch.zeros((batch_size,n_order,n_spec),device=device)
-        #x = torch.linspace(-1,1,n_spec,device=device).repeat(batch_size,1)
-        #for i in range(n_order):
-        #    yfit[:,i,:] = cubic_transform(self.x_point,y_point[:,i,:],x)
         if not full:return yfit
 
 class TelluricModel(nn.Module):
@@ -274,7 +261,7 @@ class TelluricModel(nn.Module):
                  instrument,
                  n_decoder=6,
                  n_continuum=2,
-                 joint_model=True,
+                 joint_model=False,
                 ):
 
         super(TelluricModel, self).__init__()
@@ -288,40 +275,45 @@ class TelluricModel(nn.Module):
             self.decoder = MLP(n_decoder,wave_rest.shape[0],
                                n_hidden=(),act=(nn.Identity(),))
         else: 
-            self.decoder = MultipleMLP(n_decoder,n_spec,n_channel=n_channel,n_hidden=())
+            self.decoder = MultipleMLP(n_decoder,n_spec,
+                                       n_channel=n_channel,
+                                       n_hidden=(),
+                                       act=(nn.Identity(),))
         self.lsf = None
         self.register_buffer('wave_rest', wave_rest)
         # initialize weights to avoid large fluctuation
         for p in self.decoder.parameters():torch.nn.init.normal_(p,std=1e-3)
 
+    def rectify(self, x):
+        return x
+
     def encode(self, x):
         return self.encoder(x)
     
     def decode(self, x):
-        return torch.sin(self.decoder(x))
-
-    def forward(self, s, z):
-        x = self.decode(s)
-        x = 1.0 - self.transform(x,z)
+        x = self.decoder(x)
+        x = self.rectify(x)
         return x
 
-    def _forward(self, s, z):
+    def forward(self, s, wave):
+        x = self.decode(s)
+        x = 1.0 - self.transform(x,wave)
+        return x
+
+    def _forward(self, s, wave):
         x_lines = self.decode(s)
-        x = 1.0 - self.transform(x_lines,z)
+        x = 1.0 - self.transform(x_lines,wave)
         return x_lines,x
 
-    def transform(self, spectrum_restframe, z):
-        xx = self.wave_rest
-        wave_obs = self.instrument.wave_obs
-        n_order,n_spec = wave_obs.shape
-        n_batch = spectrum_restframe.shape[0]
-        if self.lsf is None: spectrum_conv = spectrum_restframe
-        else:spectrum_conv = self.lsf(spectrum_restframe.unsqueeze(1)).squeeze(1)
-        spectrum = torch.ones((n_batch,n_order,n_spec),device=z.device)
+    def transform(self, spectrum_restframe, wave_raw):
+        n_batch,n_order,n_spec = wave_raw.shape
+        xx = self.wave_rest.repeat(n_batch,1,1)
+        spectrum = torch.zeros((n_batch,n_order,n_spec),device=wave_raw.device)
         for i in range(n_order):
-            wave_redshifted = - wave_obs[i] * z[:,[i]] + wave_obs[i]
-            mask = (xx>wave_redshifted.min())&(xx<wave_redshifted.max())
-            spectrum[:,i,:] = cubic_transform(xx[mask], spectrum_conv[:,mask], wave_redshifted)
+            # to keep wavelength contiguous
+            wave = wave_raw[:,i,:].clone()
+            #spectrum[:,i,:] = cubic_transform(xx[i], spectrum_restframe[:,i,:], wave)
+            spectrum[:,i,:] = Interp1d()(xx[:,i,:], spectrum_restframe[:,i,:], wave)
         return spectrum
 
 #### Spectrum decoder ####
@@ -336,7 +328,6 @@ class SpectrumDecoder(MultipleMLP):
                  act=None,
                  dropout=0,
                  datatag="mockdata",
-                 lsf_size=31,
                 ):
         print("wave_rest:",wave_rest.shape,wave_rest.dim())
         if wave_rest.dim() == 1:
@@ -344,7 +335,9 @@ class SpectrumDecoder(MultipleMLP):
         else: n_channel,n_spec = wave_rest.shape
 
         if act==None: 
-            act = [nn.LeakyReLU() for i in range(len(n_hidden)+1)]
+            act = [nn.LeakyReLU() for i in range(len(n_hidden))]
+            # Last layer should allow negative outputs
+            act.append(nn.PReLU())
 
         super(SpectrumDecoder, self).__init__(
             n_latent,
@@ -356,19 +349,8 @@ class SpectrumDecoder(MultipleMLP):
             )
 
         self.n_latent = n_latent
-        #self.decode_act = nn.Identity()
-        self.decode_act = nn.LeakyReLU()
-
         self.lsf = None
-        '''
-        self.lsf = nn.Conv1d(1, n_order, lsf_size, bias=False, padding='same',padding_mode="replicate")
-        sigma = torch.ones((n_order),device=wave_rest.device)*5
-        x_pix = torch.arange(-(lsf_size-1)//2,(lsf_size-1)//2+1,device=wave_rest.device)
-        x_sigma = x_pix[None,:]/sigma[:,None]
-        y_pix = torch.exp(-(x_sigma)**2/(2))
-        y_pix /= y_pix.sum(dim=1)[:,None]
-        self.lsf.weight.data=y_pix[:,None,:]
-        '''
+
         if spec_rest is None:
             self.spec_rest= torch.nn.Parameter(torch.randn(wave_rest.shape))
         else: self.spec_rest= torch.nn.Parameter(spec_rest.float())
@@ -376,20 +358,19 @@ class SpectrumDecoder(MultipleMLP):
 
     def decode(self, s):
         x = super().forward(s)
-        x = self.decode_act(x)
         return x
 
     def forward(self, s):
         return self.decode(s)
 
     def transform(self, spectrum_restframe, z, wave):
-        xx = self.wave_rest
         n_batch,n_order,n_spec = wave.shape
-        #spectrum_restframe=self.lsf(spectrum_restframe)
+        xx = self.wave_rest.repeat(n_batch,1,1)
         spectrum = torch.ones_like(wave)
         for i in range(n_order):
             wave_redshifted = - wave[:,i,:] * z[:,[i]] + wave[:,i,:]
-            spectrum[:,i,:] = cubic_transform(xx[i], spectrum_restframe[:,i,:], wave_redshifted)
+            #spectrum[:,i,:] = cubic_transform(xx[i], spectrum_restframe[:,i,:], wave_redshifted)
+            spectrum[:,i,:] = Interp1d()(xx[:,i,:], spectrum_restframe[:,i,:], wave_redshifted)
         return spectrum
 
     @property
@@ -462,11 +443,19 @@ class BaseAutoencoder(nn.Module):
         # to make it to order unity for comparing losses, divide out L (number of bins)
         # instead of D, so that spectra with more valid bins have larger impact
         if w.dim()==1:w=w.unsqueeze(1)
-        loss_ind = torch.sum(w * (x - spectrum_observed).pow(2), dim=-1) / x.shape[-1]
+        loss_ind = w * (x - spectrum_observed).pow(2)
+        
+        #Find the max values and their indices along the last dimension
+        #max_ind = torch.argmax(loss_ind, dim=2) 
+        #batch_i = torch.arange(x.shape[0]).view(-1, 1).expand(-1, 3) 
+        #order_i = torch.arange(x.shape[1]).repeat(x.shape[0], 1)
+
+        # Access the elements at the maximum positions
+        #loss_ind[batch_i, order_i, max_ind] = 0
+        loss_ind = torch.sum(loss_ind, dim=-1) / torch.sum(w>1,dim=2)
         if individual:
             return loss_ind
-        D = loss_ind.shape[1]# - 1
-        #loss_ind[:,1] = 0 # skip order 1 
+        D = loss_ind.shape[1]
         return torch.sum(loss_ind) / D
 
     def _normalization(self, x, m, w=None):

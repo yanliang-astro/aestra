@@ -14,47 +14,67 @@ from torchinterp1d import Interp1d
 from torchcubicspline import natural_cubic_spline_coeffs
 from astropy.timeseries import LombScargle
 
-def interpolate_to_input_grid(batch,instrument,template_data,spectrum_trend,aug=False,planetary_rv=0):
-    wave_raw,spec_raw,w_raw,ssbrv,jd,telluric_spec = batch
+def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,telluric_raw=1,aug=False,planetary_rv=0,normalize=False):
+    wave_raw,spec_raw,w_raw,ssbrv = batch[:4]
     wave_obs = instrument.wave_obs
     n_order,n_spec = wave_obs.shape
     n_batch = spec_raw.shape[0]
     device = wave_obs.device
+    template = template_data[1].repeat(n_batch,1,1)
 
     # produce augmentation data -- inject rv offset
     if aug:
         z_lim = 5e-8 # 15 m/s
+        #z_lim = 1e-8 # 3 m/s
         z_offset = z_lim*(torch.rand(n_batch,1, device=device)-0.5)
     else: z_offset = 0
 
-    template_w = template_data[2]
-    # remove tellurics and continuum
-    spec = spec_raw#/(telluric_spec*(spectrum_trend+1))    
+    # renormalize raw spectra based on regions not affected by telluric lines
+    if normalize:
+        norm = torch.zeros((n_batch,n_order),device=device)
+        for i in range(n_order):
+            non_sky = spec_raw[:,i,~skymask[i]]
+            norm[:,i] = torch.median(non_sky,dim=1)[0]
+        spec_raw /= norm[:,:,None]
 
+    # remove tellurics
+    spec = spec_raw
     # total rv = ssbrv + injected planetary_rv + rv offset
     z = (ssbrv*1e3+planetary_rv)/instrument.c + z_offset
 
     spectrum = torch.zeros((n_batch,n_order,n_spec),device=device)
-    #w = torch.zeros((n_batch,n_order,n_spec),device=device)
     wave = wave_raw + wave_raw * z[:,:,None]
 
     out = torch.zeros_like(spectrum,dtype=bool)
     for i in range(n_order):
         spectrum[:,i,:] = Interp1d()(wave[:,i,:], spec[:,i,:], wave_obs[i])
-        #if not aug:w[:,i,:] = Interp1d()(wave[:,i,:], w_raw[:,i,:], wave_obs[i])
         wmin = wave[:,i,:].min(dim=1)[0]
         wmax = wave[:,i,:].max(dim=1)[0]
         out_ = (wave_obs[i]<wmin.unsqueeze(1))|(wave_obs[i]>wmax.unsqueeze(1))
         out[:,i,:] = out_
-    ill = (template_w<1)
-    spectrum[ill|out] = 0
+    ill = (template==0)|(spectrum==0)
+    # mask out +/- 1 pixel of bad input data (zero flux)
+    bad = (spectrum<(template*0.6))|ill
+    # after linear interpolation, bad flux values are at most half of template values
+    # cut at 0.6 for safety
+    bad |= torch.roll(bad, -1, dims=2)
+    bad |= torch.roll(bad, +1, dims=2)
+    bad |= out
+    #spectrum[out|bad] = template[out|bad]
+
     if aug:
         sigma = (w_raw.mean())**(-0.5)
         spec_noise = sigma*torch.normal(mean=0,std=1.0,size=spectrum.shape,
                                         device=device)
-        spec_noise[ill|out]=0
         spectrum += spec_noise
-    return spectrum, z_offset
+
+    # normalize input residual spectrum to zero
+    spec_input = spectrum-template
+    spec_input[bad] = 0
+    spec_mean = spec_input.sum(dim=2)/(~bad).sum(dim=2)
+    spec_input -= spec_mean[:,:,None]
+    spec_input[bad] = 0
+    return spec_input, z_offset
 
 
 def merge_batch(file_batches):
@@ -122,20 +142,6 @@ def moving_mean(x,y,w=None,n=20,skip_weight=True):
             delta_y[i] = np.sqrt(np.cov(y[mask], aweights=w[mask]))/np.sqrt(mask.sum())
     return xgrid,ygrid,delta_y
 
-'''
-def calculate_fft(time,signal):
-    time_interval = time[1]-time[0]
-    # Perform the FFT
-    fft = np.fft.fft(signal)
-    # Calculate the frequency axis
-    freq_axis = np.fft.fftfreq(len(signal), time_interval)
-    real  = freq_axis>0
-    p_axis = 1.0/freq_axis[real]
-    # Only show the real part of the power spectrum
-    power_spectrum = np.real(fft * np.conj(fft))
-    power_spectrum /= max(power_spectrum[real])
-    return p_axis,power_spectrum[real]
-'''
 def plot_fft(timestamp,signals,fname,labels,period=100,fs=14):
     cs = ["grey","k","b","r"]
     alphas = [1,1,1,0.7]
