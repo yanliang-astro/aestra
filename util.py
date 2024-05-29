@@ -14,7 +14,17 @@ from torchinterp1d import Interp1d
 from torchcubicspline import natural_cubic_spline_coeffs
 from astropy.timeseries import LombScargle
 
-def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,telluric_raw=1,aug=False,planetary_rv=0,normalize=False):
+def normalize_residual(spectrum,weight,template):
+    bad = weight<1.0
+    # normalize input residual spectrum to zero
+    spec_input = spectrum-template
+    spec_input[bad] = 0
+    spec_mean = spec_input.sum(dim=2)/(~bad).sum(dim=2)
+    spec_input -= spec_mean[:,:,None]
+    spec_input[bad] = 0
+    return spec_input
+
+def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,telluric_raw=1,aug=False,planetary_rv=0):
     wave_raw,spec_raw,w_raw,ssbrv = batch[:4]
     wave_obs = instrument.wave_obs
     n_order,n_spec = wave_obs.shape
@@ -29,30 +39,22 @@ def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,tellur
         z_offset = z_lim*(torch.rand(n_batch,1, device=device)-0.5)
     else: z_offset = 0
 
-    # renormalize raw spectra based on regions not affected by telluric lines
-    if normalize:
-        norm = torch.zeros((n_batch,n_order),device=device)
-        for i in range(n_order):
-            non_sky = spec_raw[:,i,~skymask[i]]
-            norm[:,i] = torch.median(non_sky,dim=1)[0]
-        spec_raw /= norm[:,:,None]
-
-    # remove tellurics
-    spec = spec_raw
     # total rv = ssbrv + injected planetary_rv + rv offset
-    z = (ssbrv*1e3+planetary_rv)/instrument.c + z_offset
+    z = (ssbrv+planetary_rv)/instrument.c + z_offset
 
     spectrum = torch.zeros((n_batch,n_order,n_spec),device=device)
+    weight = torch.zeros((n_batch,n_order,n_spec),device=device)
     wave = wave_raw + wave_raw * z[:,:,None]
 
     out = torch.zeros_like(spectrum,dtype=bool)
     for i in range(n_order):
-        spectrum[:,i,:] = Interp1d()(wave[:,i,:], spec[:,i,:], wave_obs[i])
+        spectrum[:,i,:] = Interp1d()(wave[:,i,:], spec_raw[:,i,:], wave_obs[i])
+        weight[:,i,:] = Interp1d()(wave[:,i,:], w_raw[:,i,:], wave_obs[i])
         wmin = wave[:,i,:].min(dim=1)[0]
         wmax = wave[:,i,:].max(dim=1)[0]
         out_ = (wave_obs[i]<wmin.unsqueeze(1))|(wave_obs[i]>wmax.unsqueeze(1))
         out[:,i,:] = out_
-    ill = (template==0)|(spectrum==0)
+    ill = (template==0)|(spectrum==0)|(weight<1.0)
     # mask out +/- 1 pixel of bad input data (zero flux)
     bad = (spectrum<(template*0.6))|ill
     # after linear interpolation, bad flux values are at most half of template values
@@ -60,26 +62,21 @@ def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,tellur
     bad |= torch.roll(bad, -1, dims=2)
     bad |= torch.roll(bad, +1, dims=2)
     bad |= out
-    #spectrum[out|bad] = template[out|bad]
+    
+    weight[bad] = 1e-12
 
     if aug:
-        sigma = (w_raw.mean())**(-0.5)
+        sigma = (weight.mean())**(-0.5)
         spec_noise = sigma*torch.normal(mean=0,std=1.0,size=spectrum.shape,
                                         device=device)
         spectrum += spec_noise
 
-    # normalize input residual spectrum to zero
-    spec_input = spectrum-template
-    spec_input[bad] = 0
-    spec_mean = spec_input.sum(dim=2)/(~bad).sum(dim=2)
-    spec_input -= spec_mean[:,:,None]
-    spec_input[bad] = 0
-    return spec_input, z_offset
+    return spectrum, weight, z_offset
 
 
 def merge_batch(file_batches):
     waves = [];spectra = [];weights = []
-    ssbrv = [];specid = [];telluric = []
+    ssbrv = [];specid = []
     for batchname in file_batches:
         print("batchname:",batchname)
         batch = load_batch(batchname)
@@ -88,17 +85,15 @@ def merge_batch(file_batches):
         weights.append(batch[2])
         ssbrv.append(batch[3])
         specid.append(batch[4])
-        telluric.append(batch[5])
     waves =  torch.cat(waves,axis=0)
     spectra = torch.cat(spectra,axis=0)
     weights = torch.cat(weights,axis=0)
     ssbrv = torch.cat(ssbrv,axis=0)
     specid = torch.cat(specid,axis=0)
-    telluric = torch.cat(telluric,axis=0)
     print("waves:",waves.shape,"spectra:",spectra.shape,
           "w:",weights.shape,"ssbrv:",ssbrv.shape,
-          "specid:",specid.shape,"telluric:",telluric.shape)
-    return waves,spectra, weights, ssbrv, specid,telluric
+          "specid:",specid.shape)
+    return waves,spectra, weights, ssbrv, specid
 
 def cubic_evaluate(coeffs, tnew):
     t = coeffs[0]
@@ -140,6 +135,19 @@ def moving_mean(x,y,w=None,n=20,skip_weight=True):
         else:
             ygrid[i] = np.average(y[mask],weights=w[mask])
             delta_y[i] = np.sqrt(np.cov(y[mask], aweights=w[mask]))/np.sqrt(mask.sum())
+    return xgrid,ygrid,delta_y
+
+def moving_median(x,y,n=20):
+    dx = (x.max()-x.min())/n
+    xgrid = np.linspace(x.min(),x.max(),n+2)
+    xgrid = xgrid[1:-1]
+    ygrid = np.zeros_like(xgrid)
+    delta_y = np.zeros_like(xgrid)
+    for i,xmid in enumerate(xgrid):
+        mask = x>(xmid-dx)
+        mask *= x<(xmid+dx)
+        ygrid[i] = np.median(y[mask])
+        delta_y[i] = y[mask].std()/np.sqrt(mask.sum())
     return xgrid,ygrid,delta_y
 
 def plot_fft(timestamp,signals,fname,labels,period=100,fs=14):
