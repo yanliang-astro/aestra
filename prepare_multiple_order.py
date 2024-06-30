@@ -232,29 +232,38 @@ def save_auxfile(input_data,filename):
     return
 
 
-def make_batch(sample_names):
+def make_batch(sample_names,max_neg_flux=100,max_wave_std=0.0005):
     large_number = 1e6
     batch_size = len(sample_names)
     wavemat =  np.zeros((batch_size,n_order,N_SPEC))
     specmat = np.zeros((batch_size,n_order,N_SPEC))
     errmat = np.zeros((batch_size,n_order,N_SPEC))
     good =  np.ones((batch_size),dtype=bool)
-    neid_dict = {}
+    local_dict = {}
     for i_obs,obsname in enumerate(sample_names):
         data,info_dict = prepare_spectrum(obsname)
         wavelength,spectrum,spectrum_err = data
         # negative flux?
         neg = np.sum(spectrum<0.0,axis=-1)
-        if neg.sum()>100:
+        if neg.sum()>max_neg_flux:
             good[i_obs] = False
             print("negative!!",obsname,neg)
             print("flux: %.2f, %.2f"%(spectrum.min(),spectrum.max()))
         #if spectrum.min()<0.01:good[i_obs] = False
         if not good[i_obs]: continue
-        neid_dict[obsname] = info_dict
+        local_dict[obsname] = info_dict
         wavemat[i_obs,:,:] = wavelength
         specmat[i_obs,:,:] = spectrum
         errmat[i_obs,:,:] = spectrum_err
+
+    wave_mean = np.mean(wavemat,axis=0,keepdims=True)
+    wave_std = (wavemat-wave_mean).std(axis=-1)
+    wh_obs,_ = np.where(wave_std>max_wave_std)
+    for i_obs in np.unique(wh_obs):
+        good[i_obs] = False
+        print("unusual wave solution: %d, skip..."%i_obs)
+    print("wave_std:",wave_std.shape)
+    print("where",wh_obs)
 
     bad = errmat**(-2)<1.0
     print("bad pixels:",(bad.sum()/batch_size))
@@ -263,7 +272,11 @@ def make_batch(sample_names):
     wavemat=wavemat[good]
     specmat=specmat[good]
     errmat=errmat[good]
-    return sample_names[good],wavemat,specmat,errmat,neid_dict
+
+    good_dict={}
+    for i_obs,obsname in enumerate(sample_names):
+        if good[i_obs]:good_dict[obsname] = local_dict[obsname]
+    return sample_names[good],wavemat,specmat,errmat,good_dict
 
 def photon_noise(spec_rest,wave_rest,sn):
     A0 = spec_rest*(sn**2)
@@ -400,7 +413,7 @@ def wrap_data(sample_names,datatag,batch_size):
         ax.fill_between(wave_obs,template[o]-err,template[o]+err,
                         color="k",alpha=0.3)
         ax.plot(wave_obs,dispersion[o],"r-",lw=1,drawstyle="steps-mid")
-        ax.set_xlim(wave_obs[300]-2,wave_obs[300]+2)
+        #ax.set_xlim(wave_obs[300]-2,wave_obs[300]+2)
         ax.set_ylim(-0.05,1.1)
     plt.savefig("[%s]template.png"%tag,dpi=200)
 
@@ -418,7 +431,7 @@ def wrap_data(sample_names,datatag,batch_size):
     neid_dict.update({"info":general_info})
     with open("%s-param.pkl"%datatag,"wb") as f:
         pickle.dump(neid_dict,f)
-    return
+    return sample_names
 
 def calculate_v_template(sample_names,datatag):
     print("Loading from %s-param.pkl"%datatag)
@@ -627,53 +640,32 @@ print("input_wave:",input_wave.shape)
 
 datatag = "%s_N%d"%(tag,n_sample)
 
+file_path = "NEID_QUIET_OBSNAME.txt"
+# Load the data from the text file
+data = np.loadtxt(file_path, dtype={'names': ('filename', 'jd', 'ccfrv', 'snr'), 'formats': ('S30', 'f8', 'f8', 'f8')})
 
-# reading the CSV file
-csvfilename = 'NEID_2021B.csv'
-csvFile = pandas.read_csv("%s/%s"%(datadir,csvfilename))
-neid_filenames = np.array(csvFile.filename)
-neid_jd = np.array(csvFile.ccfjdsum)
-neid_ccfrv = csvFile.ccfrvmod
-neid_snr =  np.array(csvFile.extsnr)
-quality_flag = (np.array(csvFile.flaggedval,dtype=str)=='x')
+# Extract columns into separate arrays
+neid_filenames = np.array([x.decode('utf-8') for x in data['filename']])
+neid_jd = data['jd']
+neid_ccfrv = data['ccfrv']
+neid_snr = data['snr']
 
-excluded = neid_jd<2e6
-excluded |= ((neid_jd>2459495)&(neid_jd<2459515))
-excluded |= quality_flag
 existing_files = os.listdir(datadir)
-'''
-import time
-for obs in existing_files:
-    path = '%s/%s'%(datadir,obs)
-    file_size = os.path.getsize(path)
-    if not obs in neid_filenames:continue
-    where = np.where(neid_filenames==obs)[0][0]
-    if file_size<86155200 and neid_jd[where]==-1.0:
-        ti_m = os.path.getmtime(path)
-        ti_m = time.ctime(ti_m)
-        #os.system("rm %s"%path)
-        print(path,file_size,ti_m,"CCFRV:",neid_ccfrv[where])
-'''
-available = np.array([name in existing_files for name in neid_filenames])
+print("existing files:",len(existing_files))
+print("qualified files:",len(neid_filenames))
 
-excluded |= ~available
-
-snr_cut = 400
-excluded |= neid_snr < snr_cut
-sel = np.arange(len(neid_filenames))[(~excluded)]
-
+# Find the indices of available_names in full_names
+sel = np.nonzero(np.in1d(neid_filenames, existing_files))[0]
 print("total number:",len(sel))
+
+#excluded |= ((neid_jd>2459495)&(neid_jd<2459515))
+#snr_cut = 400
+#excluded |= neid_snr < snr_cut
 np.random.shuffle(sel)
 sel = sel[:n_sample]
 sample_names = list(neid_filenames[sel])
 print("order:",order_value)
 print("sample_names:",len(sample_names))
-
-idx = np.arange(0, len(sample_names), batch_size)
-batches = np.array_split(sample_names, idx[1:])
-
-file_batches = ["%s/%s_%d.pkl"%(dynamic_dir,datatag,k) for k in range(len(batches))]
-print("file_batches:",file_batches)
 
 #preview_spectrum("neidL2_20211109T204628.fits")
 #preview_spectrum("neidL2_20220416T185324.fits")
@@ -682,17 +674,20 @@ n_order = input_wave.shape[0]
 
 if not load_data:
     save_auxfile(input_wave,"%s/%s-wavelength.pkl"%(dynamic_dir,datatag))
-    wrap_data(sample_names,datatag,batch_size)
+    sample_names = wrap_data(sample_names,datatag,batch_size)
     calculate_v_template(sample_names,datatag)
 
 #with open("skymask.pkl","rb") as f:
 #    skymask = pickle.load(f)
 #    save_auxfile(skymask,"%s/%s-skymask.pkl"%(dynamic_dir,datatag))
 
+exit()
 print("Loading from %s-param.pkl"%datatag)
 with open("%s-param.pkl"%datatag,"rb") as f:
     neid_dict = pickle.load(f)
 print("neid_dict:",len(neid_dict))
+
+
 
 #calculate_v_template(sample_names,datatag)
 sample_names = neid_dict["info"]["sample_names"]
@@ -753,7 +748,7 @@ for i in range(n_order):
 v_template = v_template_order
 v_template -= np.median(v_template,axis=-1,keepdims=True)
 
-'''
+#'''
 fig,ax=plt.subplots(figsize=(8,3),constrained_layout=True)
 for i in range(n_order):
     label_template = velocity_label(v_template[i],"$v_{template}$")
@@ -765,22 +760,27 @@ for i in range(n_order):
 ax.set_xlabel("Time [days]");ax.set_ylabel("$v_{template}$ [m/s]")
 ax.legend(ncols=2)
 plt.savefig("[%s]v_template.png"%datatag,dpi=300)
-'''
-skymask = load_batch("%s/%s-skymask.pkl"%(dynamic_dir,datatag)).bool()
+
+idx = np.arange(0, len(sample_names), batch_size)
+batches = np.array_split(sample_names, idx[1:])
+file_batches = ["%s/%s_%d.pkl"%(dynamic_dir,datatag,k) for k in range(len(batches))]
+print("file_batches:",file_batches)
 
 # load generated data
 batch = merge_batch(file_batches)
 wave_raw,spec_raw,weights,ssbrvs,ids = [item.numpy() for item in batch]
 
-spec_raw[:,skymask] = 0
-weights[:,skymask] = 1e-6
-
+try:
+    skymask = load_batch("%s/%s-skymask.pkl"%(dynamic_dir,datatag)).bool()
+    spec_raw[:,skymask] = 0
+    weights[:,skymask] = 1e-6
+except:print("skymask does not exist...")
 n_epoch,n_order,N_SPEC = spec_raw.shape
 wave_mean = np.median(wave_raw,axis=0)
 wave_std = np.std(wave_raw,axis=0)
-
+'''
 print("Calculate model weight!")
-#save_auxfile(input_wave,"%s/%s-wavelength.pkl"%(dynamic_dir,datatag))
+fig,ax=plt.subplots(figsize=(8,3),constrained_layout=True)
 model_weight = np.zeros_like(input_wave)
 print(wave_raw.shape,input_wave.shape,ssbrvs.shape)
 for o in range(n_order):
@@ -801,19 +801,6 @@ for o in range(n_order):
 plt.savefig("test.png",dpi=200)
 zero_w = (model_weight<1).sum()
 print("zero weight bins: %d (%.4f)"%(zero_w,zero_w/(n_order*N_SPEC)))
-exit()
-'''
-fig,ax=plt.subplots(figsize=(8,5),constrained_layout=True)
-o = 5
-mask = (wave_mean[o]>5168.75) & (wave_mean[o]<5169)
-chunk = spec_raw[:,o,mask]
-print("outlier:",np.where(chunk==chunk.max()))
-for i in range(n_epoch):
-    ax.plot(wave_raw[i][o][mask],chunk[i],"k-",alpha=0.1,
-            drawstyle="steps-mid")
-ax.set_xlabel("wavelength")
-plt.savefig("test.png",dpi=300)
-exit()
 '''
 
 fig,ax=plt.subplots(figsize=(8,3),constrained_layout=True)
@@ -828,6 +815,9 @@ ax.set_xlabel("wavelength")
 ax.set_ylabel("wavelength dispersion")
 plt.savefig("[%s]wavelength.png"%datatag,dpi=300)
 
+#def visualize_features():
+#    spec,w_star,_ = interpolate_to_input_grid(batch,instrument,template_data,planetary_rv=v_planet)
+#    spec_star = normalize_residual(spec,w_star,template)
 
 n_cut = 10
 cut_params = ssbrvs.mean(axis=1)
@@ -840,7 +830,7 @@ for i in range(n_cut-1):
 print("dispersion:",dispersion.shape)
 dispersion = np.median(dispersion,axis=0)
 dispersion[np.isnan(dispersion)] = 0
-rank = np.argsort(base_chi_order[5])[::-1]
+rank = np.argsort(base_chi_order[0])[::-1]
 #i_plots = [0,1,2,3,4,5]#
 #rank = np.argsort(ssbrvs.mean(axis=0))
 i_plots = rank[:50]
@@ -858,7 +848,7 @@ cmap = get_cmap('plasma_r')
 tmin,tmax = min(timestamp[i_plots]),max(timestamp[i_plots])
 colors =[cmap((t-tmin)/(tmax-tmin)) for t in timestamp[i_plots]]
 
-mask = np.arange(7800,8000)
+mask = np.arange(6500,6800)
 #mask = np.arange(0,N_SPEC)
 ncols = 3
 nrows = n_order//ncols
@@ -868,7 +858,7 @@ for i_order,o in enumerate(order_value):
     base_chi = base_chi_order[i_order]
     i_row,i_col = i_order//ncols,i_order%ncols
     i_image = 0
-    ax = axs[i_row,i_col]
+    ax = axs[i_col]
     for i_obs,obsname in enumerate(sample_names):
         if not i_obs in i_plots:continue
         ccfrv = ccf_norm[i_order][i_obs]
@@ -907,7 +897,6 @@ fig,axs = plt.subplots(nrows=3,figsize=(8,10),constrained_layout=True)
 ax=axs[0]
 ax.scatter(neid_jd[neid_jd>2e6],neid_ccfrv[neid_jd>2e6],c="grey",s=5,label="all (N=%d)"%len(neid_jd))
 img = ax.scatter(neid_jd[sel],neid_ccfrv[sel],c=neid_snr[sel],cmap="inferno",s=5,label="selected (N=%d)"%len(sample_names))
-ax.set_ylim(-1.2,-0.2)
 cbar = plt.colorbar(img)
 cbar.set_label("S/N")
 ax.legend(loc="upper left")
@@ -916,24 +905,26 @@ ax.set_ylabel("NEID Solar RV [km/s]")
 
 ax_in = ax.inset_axes([0.58, 0.1, 0.4, 0.3])
 ax_in.hist(neid_snr,color="grey",log=True)
-ax_in.axvline(snr_cut,ls="--",color="k")
+#ax_in.axvline(snr_cut,ls="--",color="k")
 ax_in.set_title("S/N")
 
 ax=axs[1]
 for i,o in enumerate(order_value):
-    ax.scatter(timestamp,v_template[i],c=bright_colors[i],s=5,
+    ax.scatter(timestamp,v_template[i],c=bright_colors[i],s=3,
                label="%d $v_{template}$ vs. $v_{CCF}$ RMS = %.2f m/s vs. %.2f m/s"%(o,v_template[i].std(),ccf_norm[i].std()))
-    ax.scatter(timestamp,ccf_norm[i],c=grey_colors[i],s=5)
+    ax.scatter(timestamp,ccf_norm[i],c=grey_colors[i],s=3)
 
 ax.legend(title="Discrepancy RMS = %.2f m/s"%template_ccf_offset.std())
+ax.set_xlim(700,900)
 ax.set_xlabel("JD")
 ax.set_ylabel("RV [m/s]")
 
 ax=axs[2]
 for i,o in enumerate(order_value):
-    ax.scatter(timestamp,base_chi_order[i],c=bright_colors[i],s=5,
+    ax.scatter(timestamp,base_chi_order[i],c=bright_colors[i],s=3,
                label="%d $\chi^2_{template}$, RMS = %.2f m/s"%(o,base_chi_order[i].std()))
 ax.set_xlabel("JD")
+ax.set_xlim(700,900)
 ax.set_ylabel("$\chi^2_r$")
 
 plt.savefig("[%s]sample-selection.png"%tag,dpi=300)

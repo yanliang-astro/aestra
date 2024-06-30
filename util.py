@@ -13,6 +13,7 @@ import pickle, humanize, psutil, GPUtil, io, random
 from torchinterp1d import Interp1d
 from torchcubicspline import natural_cubic_spline_coeffs
 from astropy.timeseries import LombScargle
+from spender_model import SpectrumAutoencoder
 
 def normalize_residual(spectrum,weight,template):
     bad = weight<1.0
@@ -64,6 +65,7 @@ def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,tellur
     bad |= out
     
     weight[bad] = 1e-12
+    spectrum[bad] = 0.0
 
     if aug:
         sigma = (weight.mean())**(-0.5)
@@ -94,6 +96,28 @@ def merge_batch(file_batches):
           "w:",weights.shape,"ssbrv:",ssbrv.shape,
           "specid:",specid.shape)
     return waves,spectra, weights, ssbrv, specid
+
+def load_model(path, instrument, device):
+    mdict = torch.load(path, map_location=device)
+    model_dict = mdict['model'][0]
+    wave_rest = model_dict['decoder.wave_rest']
+    spec_rest = model_dict['decoder.spec_rest']
+    n_latent = 3#len(model_dict['encoder.mlp.mlp.9.bias'])
+
+    model = SpectrumAutoencoder(instrument,
+                                wave_rest=wave_rest,
+                                spec_rest=spec_rest,
+                                n_latent=n_latent,
+                                normalize=False)
+    model.load_state_dict(mdict["model"][0],strict=False)
+    model.to(device)
+    model.eval()
+    return model,mdict["losses"],n_latent
+
+def simulate_planet(t,amp=1,period=0.11,t0=0):
+    phase = ((t/period)-t0)%1
+    v_planet = amp*torch.sin(2*np.pi*phase)[:,None]
+    return phase,v_planet
 
 def cubic_evaluate(coeffs, tnew):
     t = coeffs[0]
@@ -126,16 +150,20 @@ def moving_mean(x,y,w=None,n=20,skip_weight=True):
     xgrid = xgrid[1:-1]
     ygrid = np.zeros_like(xgrid)
     delta_y = np.zeros_like(xgrid)
+    non_zero = ygrid>-np.inf
     for i,xmid in enumerate(xgrid):
         mask = x>(xmid-dx)
         mask *= x<(xmid+dx)
         if skip_weight:
+            if mask.sum()<50:
+                non_zero[i] = False
+                continue
             ygrid[i] = np.mean(y[mask])
             delta_y[i] = y[mask].std()/np.sqrt(mask.sum())
         else:
             ygrid[i] = np.average(y[mask],weights=w[mask])
             delta_y[i] = np.sqrt(np.cov(y[mask], aweights=w[mask]))/np.sqrt(mask.sum())
-    return xgrid,ygrid,delta_y
+    return xgrid[non_zero],ygrid[non_zero],delta_y[non_zero]
 
 def moving_median(x,y,n=20):
     dx = (x.max()-x.min())/n
@@ -295,7 +323,6 @@ def visualize_encoding(points,points_aug,color_target,v_name,
     #ax.set_aspect('equal')
     #plt.subplots_adjust(left=0.08, bottom=0.08, right=0.95, top=0.98)
     plt.savefig("[%s]3D.png"%tag,dpi=300)
-    exit()
     return
 
 ############ Functions for creating batched files ###############

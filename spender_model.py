@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from torch import nn
 from torchinterp1d import Interp1d
-from util import cubic_transform
+#from util import cubic_transform
 
 #### Simple MLP ####
 class MLP(nn.Module):
@@ -60,7 +60,22 @@ class ParallelMLP(nn.Module):
     def forward(self, x):
         x = [mlp(x[:,i,:])[:,None,:] for i,mlp in enumerate(self.mlp)]
         x = torch.cat(x,dim=1)
-        #print("output:",x.shape,"\n",x[:,0,:5])
+        return x
+
+#### MLP which infers activity RV from latent vectors ####
+class ActivityEstimator(nn.Module):
+    def __init__(self,
+                 n_in,
+                 n_out,
+                 n_channel=1,
+                 n_hidden=(16, 16, 16),
+                 act=(nn.LeakyReLU(), nn.LeakyReLU(), nn.LeakyReLU(), nn.LeakyReLU()),
+                 dropout=0):
+        super(MultipleMLP, self).__init__()
+        self.mlp = MLP(n_in,n_out,n_hidden=n_hidden,act=act,dropout=dropout)
+
+    def forward(self, x):
+        x = self.mlp(x)
         return x
 
 class SpeculatorActivation(nn.Module):
@@ -269,25 +284,24 @@ class TelluricModel(nn.Module):
         x = self.rectify(x)
         return x
 
-    def forward(self, s, wave):
+    def forward(self, s, z, wave):
         x = self.decode(s)
-        x = 1.0 - self.transform(x,wave)
+        x = 1.0 - self.transform(x,z,wave)
         return x
 
-    def _forward(self, s, wave):
+    def _forward(self, s, z, wave):
         x_lines = self.decode(s)
-        x = 1.0 - self.transform(x_lines,wave)
+        x = 1.0 - self.transform(x_lines,z,wave)
         return x_lines,x
 
-    def transform(self, spectrum_restframe, wave_raw):
-        n_batch,n_order,n_spec = wave_raw.shape
+    def transform(self, spectrum_restframe, z, wave):
+        n_batch = spectrum_restframe.shape[0]
+        n_order,n_spec = wave.shape
         xx = self.wave_rest.repeat(n_batch,1,1)
-        spectrum = torch.zeros((n_batch,n_order,n_spec),device=wave_raw.device)
+        spectrum = torch.zeros((n_batch,n_order,n_spec),device=wave.device)
         for i in range(n_order):
-            # to keep wavelength contiguous
-            wave = wave_raw[:,i,:].clone()
-            #spectrum[:,i,:] = cubic_transform(xx[i], spectrum_restframe[:,i,:], wave)
-            spectrum[:,i,:] = Interp1d()(xx[:,i,:], spectrum_restframe[:,i,:], wave)
+            wave_redshifted = - wave[i] * z[:,[i]] + wave[i]
+            spectrum[:,i,:] = Interp1d()(xx[:,i,:], spectrum_restframe[:,i,:], wave_redshifted)
         return spectrum
 
 #### Spectrum decoder ####
