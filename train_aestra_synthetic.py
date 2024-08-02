@@ -13,7 +13,7 @@ from spender_model import SpectrumAutoencoder,NullRVEstimator
 from synthetic_data import Synthetic
 from util import mem_report
 from functools import partial
-from util import load_batch,interpolate_to_input_grid,normalize_residual
+from util import load_batch,interpolate_to_input_grid,normalize_residual,divide_sky_model
 from util import simulate_planet
 from torch.utils.data import DataLoader,Dataset
 from torchinterp1d import Interp1d
@@ -82,10 +82,14 @@ def get_all_parameters(models,instruments):
     model = models[0]
 
     # telluric model training
-    if model.telluric is not None:model_params += model.telluric.parameters()
-    else:
+    if model.telluric is not None:
+        model_params += model.telluric.parameters()
+    if model.fringe is not None:
+        model_params += model.fringe.parameters()
+    if model.encoder is not None:
         model_params += model.encoder.parameters()
         model_params += model.decoder.parameters()
+        model_params += model.activity_estimator.parameters()
         model_params += model.rv_estimator.parameters()
 
     dicts = [{'params':model_params}]
@@ -93,10 +97,10 @@ def get_all_parameters(models,instruments):
 
     return dicts,n_parameters
 
-def consistency_loss(s, s_aug, individual=False, sigma_s=0.1):
+def consistency_loss(s, s_aug, individual=False, sigma_s=0.5):
     batch_size, s_size = s.shape
     ds = torch.sum((s_aug - s)**2/(sigma_s)**2,dim=1)/(s_size)
-    cons_loss = torch.sigmoid(ds)-0.5 # zero = perfect alignment
+    cons_loss = torch.sigmoid(ds)-0.5# zero = perfect alignment
     if individual:
         return cons_loss
     return cons_loss.sum()
@@ -187,16 +191,13 @@ def plot_diagnostic(diags,instrument,n_window=2):
     import matplotlib.pyplot as plt
     from scipy.ndimage import gaussian_filter1d
     raw_data = [tensor2array(item) for item in diags["raw_data"]]
-    if "rv" in diags:rv,rv_aug,v_offset = [tensor2array(item[:,0]) for item in diags["rv"]]
+    if "rv" in diags:rv,rv_aug,v_offset,v_planet = [tensor2array(item[:,0]) for item in diags["rv"]]
     if "model" in diags:spec_obs = tensor2array(diags["model"])
-    if "telluric" in diags: spec_telluric = tensor2array(diags["telluric"])
+    if "telluric" in diags: 
+        spec_telluric = tensor2array(diags["telluric"])
+        fringe = tensor2array(diags["fringe"])
     else: spec_telluric=None
-    if "y_act" in diags: 
-        y_act = tensor2array(diags["y_act"])
-        #rest_weight = tensor2array(diags["rest_weight"])
-        #y_act[:,rest_weight==0]=0
-        #print("rest_weight:",rest_weight.shape)
-        #y_act -= y_act.mean(axis=0,keepdims=True)
+    if "y_act" in diags: y_act = tensor2array(diags["y_act"])
 
     template_data = [tensor2array(item[0]) for item in diags["template"]]
     spec_input,spec_aug,w = [tensor2array(item) for item in diags["input_data"]]
@@ -206,11 +207,31 @@ def plot_diagnostic(diags,instrument,n_window=2):
         slope_uncertainty = cov[0][0]**0.5 
         vlabel = "slope = %.3f+/-%.3f"%(poly[0],slope_uncertainty)
         print("\npredicted offset vs. true offset:",vlabel)
-        fig,ax=plt.subplots(figsize=(5,3),constrained_layout=True)
+        fig,axs=plt.subplots(figsize=(5,5),nrows=2,constrained_layout=True)
+        ax=axs[0]
         ax.plot(v_offset,rv_aug-rv,"k.",ms=3)
         ax.plot(v_offset,np.polyval(poly,v_offset), "r--",label=vlabel)
         ax.legend()
+        ax=axs[1]
+        poly,cov = np.polyfit(v_planet,rv,deg=1,cov=True)
+        slope_uncertainty = cov[0][0]**0.5 
+        vlabel = "slope = %.3f+/-%.3f"%(poly[0],slope_uncertainty)
+        print("Truth vs. Encoded RV:",vlabel)
+        print("RMS: %.2f m/s"%(rv).std())
+        ax.plot(v_planet,rv,"k.",label=vlabel)
+        ax.set_xlabel("true planetary Doppler shift")
+        ax.set_ylabel("v_encode")
+        ax.legend()
         plt.savefig("[v_encode]test.png",dpi=200)
+        plt.clf()
+
+    if "telluric" in diags:
+        x = spec_input.mean(axis=-1)[:,0]
+        fig,ax=plt.subplots(figsize=(5,3),constrained_layout=True)
+        ax.plot(x,spec_obs.mean(axis=-1)[:,0],"k.",ms=3,label="spec model")
+        ax.plot(x,fringe.mean(axis=-1)[:,0],".",c="cyan",label="fringe")
+        ax.legend()
+        plt.savefig("[yoffset]test.png",dpi=200)
         plt.clf()
 
     if not "model" in diags:exit()
@@ -220,18 +241,19 @@ def plot_diagnostic(diags,instrument,n_window=2):
     n_batch,n_order,n_spec = spec_raw.shape
     temp_err = w_template**(-0.5)
 
-
     loss = w*(spec_input-spec_obs)**2
     loss_ind = np.sum(loss, axis=-1) / np.sum(w>1,axis=-1)
+    loss_avg = gaussian_filter1d(loss.mean(axis=0),2)
+    loss_avg -= np.quantile(loss_avg,0.3)
+    print("loss_avg:",loss_avg.shape)
 
     print("masked:",(w<=1).sum()/(n_batch*n_order*n_spec))
     print("loss:",loss_ind.shape,loss_ind.mean())
-
-    sky_z = -ssbrv/instrument.c
+    sky_z = ssbrv/instrument.c
 
     diag = np.copy(loss_ind)
     diag_full = loss
-    
+
     #diag = np.abs(spec_obs.sum(axis=-1))
     #diag_full = np.abs(spec_obs)
 
@@ -244,7 +266,7 @@ def plot_diagnostic(diags,instrument,n_window=2):
     for k in range(n_window-1):
         diag[i,o_max]=0
         o_max = np.argmax(diag[i])
-        smooth_diag = gaussian_filter1d(diag_full[i,o_max],1)
+        smooth_diag = gaussian_filter1d(diag_full[i,o_max],2)
         show_orders.append(o_max)
         show_bins.append(np.argmax(smooth_diag))
 
@@ -252,6 +274,7 @@ def plot_diagnostic(diags,instrument,n_window=2):
     drawstyle = "steps-mid"
     stepstyle = "mid"
 
+    window = [1,10]
     ncols = len(show_orders)
     colors = ["k","b","darkgreen"]*n_order
     c_err = ["lightgrey","lavender","palegreen"]*n_order
@@ -261,12 +284,11 @@ def plot_diagnostic(diags,instrument,n_window=2):
         wh = show_bins[k]
         center = wave_raw[i][show_orders[k]][wh]
         for o in range(n_order):
-            if wave_obs[o].min()>center or wave_obs[o].max()<center:continue 
-   
+            if wave_obs[o].min()>center or wave_obs[o].max()<center:continue
             if o==show_orders[k]:
                 c_order = "orange"
                 err_c = "wheat"
-                zorder = 20
+                zorder = 0
             else:
                 c_order = colors[o]
                 err_c = c_err[o]
@@ -274,158 +296,50 @@ def plot_diagnostic(diags,instrument,n_window=2):
 
             ax = axs[0][k]
             spec_err = w_raw[i][o]**(-0.5)
-            ax.fill_between(wave_raw[i][o],spec_raw[i][o]-spec_err,spec_raw[i][o]+spec_err,color=err_c,step=stepstyle)
-            ax.plot(wave_raw[i][o],spec_raw[i][o],"-",color=c_order,drawstyle=drawstyle,label="order %d data"%o,zorder=zorder)
+            ax.fill_between(wave_raw[i][o]*(1+sky_z[i][o]),spec_raw[i][o]-spec_err,spec_raw[i][o]+spec_err,color=err_c,step=stepstyle,zorder=-10)
+            ax.plot(wave_raw[i][o]*(1+sky_z[i][o]),spec_raw[i][o],"-",color=c_order,drawstyle=drawstyle,label="order %d data"%o,zorder=zorder)
             if spec_telluric is not None:
-                ax.plot(wave_obs[o],spec_telluric[i][o],"-",lw=0.5,drawstyle=drawstyle,color="cyan",label="telluric")
+                ax.plot(wave_obs[o]*(1+sky_z[i][o]),spec_telluric[i][o],"-",lw=0.5,drawstyle=drawstyle,color="b",label="telluric")
+
         # order specific info
         o = show_orders[k]
-        xlim = [wave_raw[i][o][wh]-1,wave_raw[i][o][wh]+1]
+        xlim = [wave_raw[i][o][wh]-window[k],wave_raw[i][o][wh]+window[k]]
+        #if k==1: xlim = (5440,5455)
         loss_ind = loss[i][o]
         print("i,o:",i,o)
         loss_io = loss_ind.sum()/(w[i][o]>1).sum()
         print("loss_ind:",loss_io,sorted(loss_ind,reverse=True)[:10])
 
-        ax.plot(wave_obs[o]*(1+sky_z[i][o]),loss_ind/loss_ind.max(),"-",color="grey",lw=1.0,drawstyle="steps-mid",label="order %d loss = %.2f"%(o,loss_io))
+        ax.plot(wave_obs[o],loss_ind/loss_ind.max(),"-",color="grey",lw=1.0,drawstyle="steps-mid",label="order %d loss = %.2f"%(o,loss_io))
+        ax.plot(wave_obs[o],loss_avg[o],"-",color="r",lw=1.0,drawstyle="steps-mid",label="mean loss")
         ax.fill_between(wave_raw[i][o],0,1/loss_ind.max(),color="lightgrey",zorder=-20)
         ax.set_ylim(0,1.2)
-        mask = (wave_obs[o]>xlim[0])&(wave_obs[o]<xlim[1])
+
         ax = axs[1][k]
-        ax.plot(wave_obs[o,mask],spec_input[i][o][mask],c="k",lw=1,drawstyle="steps-mid",label="order %d resid"%(o))
-        ax.plot(wave_obs[o,mask],spec_obs[i][o][mask],c="r",lw=1,drawstyle="steps-mid",label="order %d loss = %.2f"%(o,loss_io))
+        ax.plot(wave_obs[o],spec_input[i][o],c="k",lw=1,drawstyle="steps-mid",label="order %d resid"%(o))
+        #ax.plot(wave_obs[o,mask],spec_aug[i][o][mask],c="b",lw=1,drawstyle="steps-mid",label="order %d aug v=%.2f m/s"%(o,v_offset[i]))
+        ax.plot(wave_obs[o],spec_obs[i][o],c="r",lw=1,drawstyle="steps-mid",label="order %d loss = %.2f"%(o,loss_io))
+        if spec_telluric is not None:
+            ax.plot(wave_obs[o],fringe[i][o],"-",lw=1.0,drawstyle=drawstyle,color="cyan",label="fringe")
         err = w[i][o]**(-0.5)
         ax.fill_between(wave_obs[o],spec_input[i][o]-err,spec_input[i][o]+err,color="k",alpha=0.3,step=stepstyle,zorder=-20)
-        ax.set_ylim(-0.015,0.015)
+        ax.set_ylim(-0.01,0.01)
         ax = axs[2][k]
         if "y_act" in diags: y_show,yname = y_act,"activity"
         else:y_show,yname = spec_input,"resid"
 
         for i_spec in range(n_batch):
-            ax.plot(wave_obs[o,mask],y_show[i_spec][o][mask],c="grey",lw=1,alpha=0.5,drawstyle="steps-mid")
-        ax.plot(wave_obs[o,mask],y_show[i][o][mask],c="k",lw=1,drawstyle="steps-mid",label="order %d %s"%(o,yname))
+            ax.plot(wave_obs[o],y_show[i_spec][o],c="grey",lw=1,alpha=0.5,drawstyle="steps-mid")
+        ax.plot(wave_obs[o],y_show[i][o],c="k",lw=1,drawstyle="steps-mid",label="order %d %s"%(o,yname))
         for i_row in range(3):
             ax = axs[i_row][k]
             ax.set_xlim(xlim);
-            #ax.set_xlim(5410,5412);
+            #if k==1:ax.set_xlim(5434,5438);
             ax.legend()
+
     plt.savefig("test.png",dpi=300)
     exit()
     return
-
-def _losses(model,
-            instrument,
-            batch,
-            template_data=None,
-            skymask=None,
-            similarity=False,
-            slope=0,
-            sigma_s=1.0,
-            fid=True,
-            skipz=False,
-            mi=False):
-
-    fid_loss = sim_loss = flex_loss = cons_loss = 0
-    # Raw spectra are in the Earth frame
-    wave_raw,spec_raw,w_raw,ssbrv,jd = batch
-    template = template_data[1]
-
-    if skymask is not None:
-        print("Masking known skylines...")
-        # stellar activity training -- masking known skylines
-        spec_raw[:,skymask] = 0
-        w_raw[:,skymask] = 1e-6
-
-    # inject planet
-    _,v_planet = simulate_planet(jd,amp=0.5,period=100.1,t0=0.0)
-    #print("v_planet:",v_planet.shape,v_planet)
-
-    # interpolate raw spectra
-    spec,w,_ = interpolate_to_input_grid(batch,instrument,template_data,planetary_rv=v_planet)
-    spec_input = normalize_residual(spec,w,template)
-
-    if skipz:
-        z = torch.zeros((spec_input.shape[0],1),device=spec_input.device)
-        z_loss = 0
-        spec_input_aug = spec_input
-    else:
-        rv =  model.estimate_rv(spec_input)
-        z = (rv)/instrument.c
-
-        spec_aug,w_aug,z_off_true = interpolate_to_input_grid(batch,instrument,template_data,aug=True,planetary_rv=v_planet)
-        spec_input_aug = normalize_residual(spec_aug,w_aug,template)
-        rv_aug = model.estimate_rv(spec_input_aug)
-
-        z_off = (rv_aug - rv)/instrument.c
-        z_loss = z_offset_loss(z_off, z_off_true)
-        flex_loss = slope*(rv**2/5.0**2).sum()
-
-        print("z_loss:",z_loss.item(),"flex_loss:",flex_loss.item(),
-              "RV: %.2f, %.2f"%(rv.min().item(),rv.max().item()),
-              "RV_aug: %.2f, %.2f"%(rv_aug.min().item(),rv_aug.max().item()))
-
-    # stellar acitivity training
-    if fid:
-        s = model.encode(spec_input)
-        s_aug = model.encode(spec_input_aug)
-        cons_loss = consistency_loss(s, s_aug)
-        y_act, spectrum_restframe, spectrum_observed = model._forward(spec, w, s, z)
-        # normalize residual model
-        spec_resid = normalize_residual(spectrum_observed,w,template)
-
-        print("s:",s.std(dim=0))
-        print("y_act:",y_act.std(dim=0).mean())
-
-        # compare residual model
-        fid_loss = model._loss(spec_input, w, spec_resid)
-        #flex_loss = slope*(y_act**2/(10)).sum()
-    else: s = 0.0
-
-    # telluric pre-training
-    if model.telluric is not None and skipz and not fid:
-        s_sky = model.telluric.encode(spec_input)
-        # telluric lines are defined in the Earth frame -- shift to stellar frame
-        print("s_sky:",s_sky.min(),s_sky.max())
-        z_sky = ssbrv/instrument.c
-        spectrum_telluric = model.telluric(s_sky,z_sky,instrument.wave_obs)
-        print("spectrum_telluric:",spectrum_telluric.shape)
-
-        # intrinsic stellar model - no variability
-        spectrum_restframe = model.decoder.spec_rest.repeat(z.shape[0],1,1)
-        spectrum_observed = model.decoder.transform(spectrum_restframe, z, instrument.wave_obs)
-        # full model = intrinsic stellar model * telluric model
-        spectrum_observed = spectrum_observed*spectrum_telluric
-
-        # normalize residual model
-        spec_resid = normalize_residual(spectrum_observed,w,template)
-        # compare residual model
-        fid_loss = model._loss(spec_input, w, spec_resid)
-    else: spectrum_telluric=1
-
-    if similarity:
-        sim_loss = similarity_restframe(model, y_act, s, slope=slope,sigma_s=sigma_s)
-    if mi:flex_loss = mutual_information(s,rv)*spec.shape[0]
-
-    if args.debug:
-        diags = {"raw_data":[wave_raw,spec_raw,w_raw,ssbrv,jd],
-                 "input_data":[spec_input,spec_input_aug,w],
-                 "template":template_data}
-
-        if model.telluric is not None:
-            diags["model"] = spec_resid
-            diags["telluric"] = spectrum_telluric
-        elif fid:
-            diags["model"] = spec_resid
-            diags["y_act"] = y_act
-            #diags["rest_weight"] = restframe_weight(model)
-            
-        if not skipz:diags["rv"]=[rv,rv_aug,z_off_true*instrument.c]
-        if similarity:
-            slope = 1.0
-            s_sim,spec_sim,sim_loss = similarity_restframe(model, y_act, s, 
-                                                           slope=slope,sigma_s=sigma_s,individual=True)
-            plot_similarity(s_sim,spec_sim,sim_loss,sigma_s=sigma_s,slope=slope)
-        plot_diagnostic(diags,instrument)
-    return fid_loss, sim_loss, flex_loss, cons_loss, z_loss
 
 def get_losses(model,
                instrument,
@@ -436,20 +350,146 @@ def get_losses(model,
                similarity=True,
                consistency=True,
                flexibility=True,
+               smoothness=True,
                slope=0,
                sigma_s=0.5,
-               skipfid=False,
+               stellar_activity=True,
                skipz=False
                ):
 
-    zeropoint_loss = 0
+    v_reg_loss = 0
+    fid_loss = sim_loss = flex_loss = cons_loss = 0
+    # Raw spectra are in the Earth frame
+    wave_raw,spec_raw,w_raw,ssbrv,jd = batch
+    template = template_data[1]
 
-    loss,sim_loss,flex_loss,cons_loss,z_loss = _losses(model, instrument, batch, similarity=similarity, slope=slope, sigma_s=sigma_s, fid=not skipfid,skipz=skipz,template_data=template_data,skymask=skymask)
+    z_null = torch.zeros((wave_raw.shape[0],1),device=wave_raw.device)
 
-    if not consistency: cons_loss = 0
-    if not flexibility: flex_loss = 0
+    if args.debug:slope=1.0
+    if skymask is not None:
+        print("Sky Mask Fraction: %.2f"%(skymask.sum()/torch.numel(skymask)))
 
-    return loss, sim_loss, z_loss, cons_loss, zeropoint_loss, flex_loss
+    # evaluate telluric & fringe models
+    if model.telluric is not None:
+        # interpolate raw spectra: telluric and fringe patterns
+        spec,w,_ = interpolate_to_input_grid(batch,instrument,template_data)
+        # normalize residual model
+        spec_input = normalize_residual(spec,w,template)
+        y_fringe = model.fringe(spec_input)
+        fringe_spec = model.fringe.cubic_interpolation(y_fringe, z_null)
+        print("fringe_spec:",fringe_spec.std().item())
+        s_sky = model.telluric.encode(spec_input)
+        # telluric lines are defined in the Earth frame -- shift to stellar frame
+        spec_sky = model.telluric(s_sky,ssbrv/instrument.c,
+                                  instrument.wave_obs,None)
+    else:
+        fringe_spec = 0
+        spec_sky = 1
+
+    # telluric & fringe pre-training, no rv model, no activity
+    if not stellar_activity:
+        # intrinsic stellar model - no variability
+        spectrum_restframe = model.decoder.spec_rest.repeat(z_null.shape[0],1,1)
+        spectrum_observed = model.decoder.transform(spectrum_restframe, z_null, instrument.wave_obs)
+        # full model = intrinsic stellar model * telluric model
+        spectrum_observed = spectrum_observed*spec_sky
+        # normalize residual model
+        model_resid = spectrum_observed-template
+        model_resid += fringe_spec
+        model_resid[w<1.0] = 0
+
+        # compare residual model
+        fid_loss = model._loss(spec_input, w, model_resid)
+        # constrain telluric flexibility
+        continuum = spec_sky>torch.quantile(spec_sky,0.05)
+        flex_loss = 50*slope*((1-spec_sky[continuum])**2).sum()
+
+    if skipz:
+        z = z_null
+        z_loss = 0
+        spec_input_aug = spec_input
+    else:
+        # inject planet
+        _,v_planet = simulate_planet(jd,amp=0.5,period=100.1,t0=0.0)
+        z_sky = (v_planet+ssbrv)/instrument.c
+
+        spec,w,_ = interpolate_to_input_grid(batch,instrument,template_data,planetary_rv=v_planet)
+        spec_sky = model.telluric(s_sky,z_sky,instrument.wave_obs,skymask)
+        spec_input = divide_sky_model(spec,w,spec_sky,fringe_spec,template)
+
+        #  generate augment spectra
+        spec_aug,w_aug,z_off_true = interpolate_to_input_grid(batch,instrument,template_data,aug=True,planetary_rv=v_planet)
+        spec_sky_aug = model.telluric(s_sky,z_sky+z_off_true,instrument.wave_obs,skymask)
+        spec_input_aug = divide_sky_model(spec_aug,w_aug,spec_sky_aug,fringe_spec,template)
+
+        rv =  model.estimate_rv(spec_input)
+        z = (rv)/instrument.c
+
+        rv_aug = model.estimate_rv(spec_input_aug)
+
+        z_off = (rv_aug - rv)/instrument.c
+        z_loss = z_offset_loss(z_off, z_off_true)
+        print("z_loss:",z_loss.item(),
+              "RV: %.2f, %.2f"%(rv.min().item(),rv.max().item()),
+              "RV_aug: %.2f, %.2f"%(rv_aug.min().item(),rv_aug.max().item()))
+
+    # stellar acitivity training
+    if stellar_activity:
+        s = model.encode(spec_input)
+        y_act, spectrum_restframe, spectrum_observed = model._forward(s, z)
+        # normalize residual model
+        model_resid = spectrum_observed-template
+        model_resid[w<1.0] = 0
+
+        print("s:",s.std(dim=0))
+        print("y_act:",y_act.std(dim=0).mean())
+
+        # compare residual model
+        fid_loss = model._loss(spec_input, w, model_resid)
+
+    else: s = 0.0
+
+    if smoothness:
+        sigma_v = 5 # m/s
+        #v_activity = model.estimate_v_act(s)
+        #v_doppler = rv-v_activity
+        v_reg_loss = (rv**2/sigma_v**2).sum()
+        print("v_reg_loss:",v_reg_loss)
+
+    if stellar_activity:
+        if consistency:
+            s_aug = model.encode(spec_input_aug)
+            cons_loss = consistency_loss(s, s_aug)
+        if flexibility:
+            #flex_loss = (w*spec_input**2).mean(dim=-1).sum()
+            flex_loss += slope*(y_act**2).sum()
+            #print("flex_loss:",flex_loss)
+
+    if similarity:
+        sim_loss = similarity_restframe(model, y_act, s, slope=slope,sigma_s=sigma_s)
+
+    if args.debug:
+        diags = {"raw_data":[wave_raw,spec_raw,w_raw,ssbrv,jd],
+                 "input_data":[spec_input,spec_input_aug,w],
+                 "template":template_data}
+
+        if model.telluric is not None:
+            diags["model"] = model_resid
+            diags["telluric"] = spec_sky
+            diags["fringe"] = fringe_spec
+        if stellar_activity:
+            diags["model"] = model_resid
+            diags["y_act"] = y_act
+
+        if not skipz:diags["rv"]=[rv,rv_aug,z_off_true*instrument.c,v_planet]
+
+        if similarity:
+            slope = 1.0
+            s_sim,spec_sim,sim_loss = similarity_restframe(model, y_act, s, 
+                                                           slope=slope,sigma_s=sigma_s,individual=True)
+            plot_similarity(s_sim,spec_sim,sim_loss,sigma_s=sigma_s,slope=slope)
+        plot_diagnostic(diags,instrument)
+    return fid_loss, sim_loss, z_loss, cons_loss, v_reg_loss, flex_loss
 
 
 def checkpoint(accelerator, args, optimizer, scheduler, n_encoder, outfile, losses):
@@ -507,7 +547,7 @@ def train(models,
           similarity=True,
           consistency=True,
           flexibility=True,
-          skipfid=False,
+          stellar_activity=True,
           skipz=False
           ):
 
@@ -591,7 +631,10 @@ def train(models,
             if models[which].telluric is not None:
                 for p in models[which].telluric.parameters():
                     p.requires_grad = mode['telluric']
+                for p in models[which].fringe.parameters():
+                    p.requires_grad = mode['telluric']
             print("Telluric:",mode['telluric'])
+            print("Fringe:",mode['fringe'])
             
             # optional: training on single dataset
             if not mode['data'][which]:
@@ -614,7 +657,7 @@ def train(models,
                     consistency=consistency,
                     flexibility=flexibility,
                     slope=slope,
-                    skipfid=skipfid,
+                    stellar_activity=stellar_activity,
                     skipz=skipz
                 )
                 # sum up all losses
@@ -672,23 +715,24 @@ if __name__ == "__main__":
     parser.add_argument("-sky", "--sky_file", help="telluric model", type=str, default="None")
     parser.add_argument("-it", "--iteration", help="number of interation", type=int, default=100000)
     parser.add_argument("-s", "--similarity", help="add similarity loss", action="store_true")
-    parser.add_argument("-skipfid", "--skipfid", help="skip fidelity loss", action="store_true",default=False)
+    parser.add_argument("-star_act", "--star_act", help="enable stellar activity", action="store_true")
     parser.add_argument("-skipz", "--skipz", help="skip rv loss", action="store_true",default=False)
     parser.add_argument("-c", "--consistency", help="add consistency loss", action="store_true")
     parser.add_argument("-d", "--double", help="double precision", action="store_true",default=False)
-    parser.add_argument("-init", "--init", help="initialize restframe", action="store_true",default=False)
-    parser.add_argument("-f", "--flexibility", help="constrian model flexibility", action="store_true",default=False)
-    parser.add_argument("-telluric", "--telluric", help="train telluric model", action="store_true",default=False)
+    parser.add_argument("-f", "--flexibility", help="constrian model flexibility", action="store_true")
+    parser.add_argument("-telluric", "--telluric", help="train telluric model", action="store_true")
+    parser.add_argument("-fringe", "--fringe", help="train fringe model", action="store_true")
     parser.add_argument("-C", "--clobber", help="continue training of existing model", action="store_true")
     parser.add_argument("-v", "--verbose", help="verbose printing", action="store_true")
     parser.add_argument("-debug", "--debug", help="show diagnostic plots", action="store_true")
     args = parser.parse_args()
 
-    wave_obs = load_batch("%s%s-wavelength.pkl"%(args.dir,args.data))
+    init_rest = load_batch("%s%s-rest.pkl"%(args.dir,args.data))
+    wave_obs = wave_rest = init_rest[0]
+    init_restframe = init_rest[1].float()
 
-    if args.sky_file == "null":
-        skymask = load_batch("%s%s-skymask.pkl"%(args.dir,args.data)).bool()
-    else: skymask = None
+    try:skymask = load_batch("%s%s-skymask.pkl"%(args.dir,args.data)).bool()
+    except: skymask = None
 
     # define instruments
     instruments = [ Synthetic(wave_obs) ]
@@ -700,27 +744,17 @@ if __name__ == "__main__":
 
     template_data = load_batch("%s%s-template.pkl"%(args.dir,args.data))
 
-    if args.init: 
-        init_rest = load_batch("%s%s-rest.pkl"%(args.dir,args.data))
-        wave_rest = init_rest[0]
-        init_restframe = init_rest[1].float()
-    else:
-        init_restframe = template_data[1]
-        wave_rest = wave_obs
-
     if args.double:
         template_data = [item.double() for item in template_data]
         if args.init: init_restframe = init_restframe.double()
-
-    weight_rest = None#load_batch("%s%s-weight.pkl"%(args.dir,args.data))
-
 
     # get augmentation function
     aug_fcts = [ inst.augment_spectra  for inst in instruments]
 
     # define training sequence
     FULL = {"data":[True],"encoder":[True],"rv":[True],
-            "decoder":True,"spec_rest":True, 'telluric':args.telluric}
+            "decoder":True,"spec_rest":True,
+            "telluric":args.telluric, "fringe":args.fringe}
     train_sequence = prepare_train([FULL],niter=args.iteration)
 
     annealing_step = 100
@@ -733,13 +767,13 @@ if __name__ == "__main__":
     models = [ SpectrumAutoencoder(instrument,
                                    wave_rest,
                                    spec_rest=init_restframe,
-                                   weight_rest=weight_rest,
+                                   weight_rest=None,
                                    n_latent=args.latents,
                                    n_hidden=n_hidden,
                                    normalize=False,
-                                   skip_encoding=args.telluric)
+                                   skip_encoding=not args.star_act)
               for instrument in instruments ]
-    #print("RVEstimator:",models[0].rv_estimator)
+
     #print("Encoder: n_latent=%d"%models[0].encoder.n_latent)
     #print("Decoder: n_latent=%d"%models[0].decoder.n_latent)
     print("Telluric: n_latent=%d"%models[0].telluric.n_latent)
@@ -771,14 +805,12 @@ if __name__ == "__main__":
         models = update_telluric(args.sky_file, models, instruments)
 
     profiler = LineProfiler()
-    profiler.add_function(partial)
-    profiler.add_function(load_batch)
+    profiler.add_function(get_losses)
     lpWrapper = profiler(train)
     lpWrapper(models, instruments, trainloaders, template_data, skymask=skymask, n_epoch=n_epoch,
-          n_batch=args.batch_number, lr=args.rate, aug_fcts=aug_fcts, similarity=args.similarity, consistency=args.consistency, flexibility=args.flexibility, skipfid=args.skipfid,skipz=args.skipz,outfile=args.outfile, losses=losses, verbose=args.verbose)
+          n_batch=args.batch_number, lr=args.rate, aug_fcts=aug_fcts, similarity=args.similarity, consistency=args.consistency, flexibility=args.flexibility, stellar_activity=args.star_act,skipz=args.skipz,outfile=args.outfile, losses=losses, verbose=args.verbose)
     
     profiler.print_stats()
-    #train(models, instruments, trainloaders, template_data, n_epoch=n_epoch,n_batch=args.batch_number, lr=args.rate, aug_fcts=aug_fcts, similarity=args.similarity, consistency=args.consistency, outfile=args.outfile, losses=losses, verbose=args.verbose)
 
     if args.verbose:
         print("--- %s seconds ---" % (time.time()-init_t))

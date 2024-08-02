@@ -2,7 +2,29 @@ import numpy as np
 import torch
 from torch import nn
 from torchinterp1d import Interp1d
-#from util import cubic_transform
+from torchcubicspline import natural_cubic_spline_coeffs
+
+def cubic_evaluate(coeffs, tnew):
+    t = coeffs[0]
+    a,b,c,d = [item.squeeze(-1) for item in coeffs[1:]]
+    maxlen = b.size(-1) - 1
+    index = torch.bucketize(tnew, t) - 1
+    index = index.clamp(0, maxlen)  # clamp because t may go outside of [t[0], t[-1]]; this is fine
+    # will never access the last element of self._t; this is correct behaviour
+    fractional_part = tnew - t[index]
+
+    batch_size, spec_size = tnew.shape
+    batch_ind = torch.arange(batch_size,device=tnew.device)
+    batch_ind = batch_ind.repeat((spec_size,1)).T
+
+    inner = c[batch_ind, index] + d[batch_ind, index] * fractional_part
+    inner = b[batch_ind, index] + inner * fractional_part
+    return a[batch_ind, index] + inner * fractional_part
+
+def cubic_transform(xrest, yrest, wave_shifted):
+    coeffs = natural_cubic_spline_coeffs(xrest, yrest.unsqueeze(-1))
+    out = cubic_evaluate(coeffs, wave_shifted)
+    return out
 
 #### Simple MLP ####
 class MLP(nn.Module):
@@ -66,12 +88,11 @@ class ParallelMLP(nn.Module):
 class ActivityEstimator(nn.Module):
     def __init__(self,
                  n_in,
-                 n_out,
-                 n_channel=1,
                  n_hidden=(16, 16, 16),
-                 act=(nn.LeakyReLU(), nn.LeakyReLU(), nn.LeakyReLU(), nn.LeakyReLU()),
+                 act=(nn.LeakyReLU(), nn.LeakyReLU(), nn.LeakyReLU(), nn.Identity()),
                  dropout=0):
-        super(MultipleMLP, self).__init__()
+        super(ActivityEstimator, self).__init__()
+        n_out = 1
         self.mlp = MLP(n_in,n_out,n_hidden=n_hidden,act=act,dropout=dropout)
 
     def forward(self, x):
@@ -160,7 +181,6 @@ class RVEstimator(nn.Module):
         x = self.mlp(x)
         return x
 
-
 class NullRVEstimator(nn.Module):
     def __init__(self):
         super(NullRVEstimator, self).__init__()
@@ -245,6 +265,98 @@ class SpectrumEncoder(nn.Module):
     def n_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+# define the order by order sinusoidal fringe model
+class FringeModel(nn.Module):
+    def __init__(self,
+                 instrument,
+                 n_latent=3,
+                 n_knot=80,
+                 n_sin=0,
+                 fringe_length=1.9, # angstrom
+                 fringe_scale=1e-2, # flux value
+                 fringe_phase=torch.pi,
+                ):
+
+        super(FringeModel, self).__init__()
+
+        x = instrument.wave_obs
+        x_min,x_max = x.min(),x.max()
+        x_normalized = x - (x_max + x_min)/2
+        n_channel,n_spec = x.shape
+
+        self.n_latent = n_latent
+        self.n_knot = n_knot
+        self.n_sin = n_sin
+        self.L = fringe_length
+        self.scale = fringe_scale
+        self.phi = fringe_phase
+        self.register_buffer('x', x_normalized)
+        self.encoder = SpectrumEncoder(instrument, n_latent)
+        self.decoder = MultipleMLP(n_latent,n_knot+n_sin,
+                                   act=(nn.LeakyReLU(), nn.LeakyReLU(), nn.LeakyReLU(), nn.Identity()),
+                                   n_channel=n_channel)#,
+                                   #n_hidden=(),act=(nn.Identity(),))
+
+    def L_k(self, k, x, x_eval, y_knot):
+        L_k = torch.ones((y_knot.size(0), x_eval.size(0)), device=x.device)
+        for i in range(x.size(0)):
+            if i != k:
+                L_k *= (x_eval - x[i]) / (x[k] - x[i])
+        return L_k
+
+    def lagrange_polynomial(self, y_knot):
+        n_order,n_spec = self.x.shape
+        x_knot = torch.linspace(-1,1,self.n_knot,device=y_knot.device)
+        x_eval = torch.linspace(-1,1,n_spec,device=y_knot.device)
+        P_batch = torch.zeros((y_knot.size(0),n_order, n_spec), device=y_knot.device, dtype=torch.float32)
+        for i in range(n_order):
+            for k in range(self.n_knot):
+                L_k = self.L_k(k, x_knot, x_eval, y_knot[:,i,:])
+                P_batch[:,i,:] += y_knot[:,i, k].unsqueeze(1) * L_k
+        return P_batch
+
+    def encode(self, x):
+        return self.encoder(x)
+
+    def decode(self, x):
+        return self.decoder(x)
+
+    def sinusoid(self, params):
+        # Reshape x_vals to (1, N_channel, 1000) for broadcasting
+        x_vals = self.x.unsqueeze(0)  # (1, N_channel, 1000)
+
+        # Extract parameters and reshape them for broadcasting
+        A = params[:, :, 0].unsqueeze(-1)
+        w0 = params[:, :, 1].unsqueeze(-1)
+        phase = params[:, :, 2].unsqueeze(-1) + self.phi
+        a1 = params[:, :, 3].unsqueeze(-1)
+
+        A = torch.abs(A)
+        # Calculate the angular frequency
+        w = 2.0*torch.pi/self.L + w0 + a1 * x_vals
+        # Calculate the modified sinusoid
+        return self.scale*A*torch.sin(w * x_vals + phase)
+
+    def polynomial(self,s):
+        return self.lagrange_polynomial(s)
+
+    def cubic_interpolation(self,y_knot,z):
+        n_order,n_spec = self.x.shape
+        x_knot = torch.linspace(-1,1,self.n_knot,device=y_knot.device)
+        x_eval = torch.linspace(-1,1,n_spec,device=y_knot.device)
+        x_eval = x_eval.repeat(y_knot.size(0),1)
+        spectrum = torch.zeros((y_knot.size(0),n_order, n_spec), device=y_knot.device, dtype=torch.float32)
+        for i in range(n_order):
+            x_shifted = - x_eval * z[:,[i]] + x_eval
+            spectrum[:,i,:] = cubic_transform(x_knot, y_knot[:,i,:], x_shifted)
+        return self.scale*spectrum
+
+    def forward(self, x):
+        x = self.encode(x)
+        x = self.decode(x)
+        return x
+
+
 class TelluricModel(nn.Module):
     def __init__(self,
                  wave_rest,
@@ -284,8 +396,9 @@ class TelluricModel(nn.Module):
         x = self.rectify(x)
         return x
 
-    def forward(self, s, z, wave):
+    def forward(self, s, z, wave, skymask):
         x = self.decode(s)
+        if skymask is not None: x[:,~skymask] = 0
         x = 1.0 - self.transform(x,z,wave)
         return x
 
@@ -385,7 +498,9 @@ class BaseAutoencoder(nn.Module):
                  decoder,
                  rv_estimator,
                  telluric,
+                 fringe,
                  normalize=False,
+                 activity_estimator=None,
                 ):
 
         super(BaseAutoencoder, self).__init__()
@@ -395,7 +510,9 @@ class BaseAutoencoder(nn.Module):
         self.decoder = decoder
         self.rv_estimator = rv_estimator
         self.telluric = telluric
+        self.fringe = fringe
         self.normalize = normalize
+        self.activity_estimator = activity_estimator
 
     def encode(self, x, aux=None):
         return self.encoder(x, aux=aux)
@@ -407,9 +524,10 @@ class BaseAutoencoder(nn.Module):
         # estimate z
         return self.rv_estimator(x)
 
-    def _forward(self, x, w, s_star, z, instrument=None, aux=None):
-        if w.dim()==1:w=w.unsqueeze(1)
+    def estimate_v_act(self,x):
+        return self.activity_estimator(x)
 
+    def _forward(self, s_star, z, instrument=None, aux=None):
         if instrument is None:
             instrument = self.encoder.instrument
 
@@ -419,15 +537,10 @@ class BaseAutoencoder(nn.Module):
         spectrum_restframe = baseline+spectrum_activity
         spectrum_observed = self.decoder.transform(spectrum_restframe, z, instrument.wave_obs)
 
-        if self.normalize:
-            c = self._normalization(x, spectrum_observed, w=w)
-            spectrum_observed = spectrum_observed * c
-            spectrum_restframe = spectrum_restframe * c
-
         return spectrum_activity, spectrum_restframe, spectrum_observed
 
-    def forward(self, x, w, s, z, instrument=None, aux=None):
-        spectrum_activity, spectrum_restframe, spectrum_observed = self._forward(x, w, s, z, instrument=instrument, aux=aux)
+    def forward(self, s, z, instrument=None, aux=None):
+        spectrum_activity, spectrum_restframe, spectrum_observed = self._forward(s, z, instrument=instrument, aux=aux)
         return spectrum_observed
 
     def loss(self, x, w, s, z, instrument=None, aux=None, individual=False):
@@ -444,7 +557,6 @@ class BaseAutoencoder(nn.Module):
         if w.dim()==1:w=w.unsqueeze(1)
         loss_ind = w * (x - spectrum_observed).pow(2)
         loss_ind = torch.sum(loss_ind, dim=-1) / torch.sum(w>1,dim=-1)
-        print("loss_ind:",loss_ind.mean().item())
         if individual:
             return loss_ind
         D = loss_ind.shape[1]
@@ -500,6 +612,9 @@ class SpectrumAutoencoder(BaseAutoencoder):
         )
 
         telluric = TelluricModel(wave_rest,instrument,n_decoder=n_telluric)
+        fringe = FringeModel(instrument)
+
+        activity_estimator = ActivityEstimator(n_latent)
 
         if rv_estimator==None:
             rv_estimator = RVEstimator(instrument.wave_obs.shape,sizes = [20,40])
@@ -514,5 +629,7 @@ class SpectrumAutoencoder(BaseAutoencoder):
             decoder,
             rv_estimator,
             telluric,
+            fringe,
+            activity_estimator=activity_estimator,
             normalize=normalize,
         )

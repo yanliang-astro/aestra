@@ -15,7 +15,7 @@ from astropy.io import fits
 from scipy.interpolate import interp1d,CubicSpline
 from scipy.special import gamma
 from synthetic_data import Synthetic
-from util import moving_mean,plot_fft,mem_report,load_batch
+from util import moving_mean,plot_fft,load_batch,load_master_fsr_mask
 
 
 dynamic_dir = "/scratch/gpfs/yanliang/neid-dynamic"
@@ -105,9 +105,9 @@ def read_fits(filename,read_keys=['OBSJD','DATE-OBS']):
     info_dict["CCFRVMOD"] = ccf_header["CCFRVMOD"]
     return [science,science_blaze,telluric_model],info_dict
 
-def get_wavelengths(poly,wave_min,wave_max):
-    input_pix = np.arange(n_pix+6)
-    input_grid = np.zeros((n_pix+6))
+def get_wavelengths(poly,wave_min,wave_max,n_pix=9216):
+    input_pix = np.arange(n_pix)
+    input_grid = np.zeros((n_pix))
     for j in range(len(input_grid)):
         if j==0:input_grid[j] = wave_min;continue
         local_bin = np.polyval(poly,input_grid[j-1])
@@ -119,13 +119,12 @@ def get_wavelengths(poly,wave_min,wave_max):
 np.random.seed(0)
 torch.manual_seed(0)
 
-sample_names = [i for i in os.listdir(datadir) if "L2_2021" in i]
+sample_names = [i for i in os.listdir(datadir) if "L2_202" in i]
 
 #"order wave_min wave_max wave_bin"
-n_sample = 500
+n_sample = 300
 n_order = 122
 n_pix = 9216
-n_bins = 12000
 deg = 2
 
 orders = np.arange(n_order)
@@ -135,13 +134,13 @@ wave_poly = np.zeros((n_order,deg+1))
 
 good_order = np.ones((n_order))
 wave_matrix = np.zeros((n_order,n_sample,n_pix))
-wgrid = np.zeros((n_order,n_sample,n_pix-1))
 wave_bin = np.zeros((n_order,n_sample,n_pix-1))
 
-#wave_bin = np.zeros((n_order))+np.inf
-#orders = [95]
+fsr_mask = load_master_fsr_mask()
+fsr_mask[:,-1] = True
 
 for i,obsname in enumerate(sample_names[:n_sample]):
+    print("loading %s..."%obsname)
     data,info_dict = read_fits("%s/%s"%(datadir,obsname))
     science,blaze,telluric = data
     wave = science[0]
@@ -156,10 +155,12 @@ for i,obsname in enumerate(sample_names[:n_sample]):
 
 for o in orders:
     if good_order[o]==0:continue
-    wleft = wave_matrix[o,:,:-1].flatten()
-    wbin = wave_bin[o].flatten()
-    poly,cov = np.polyfit(wleft,wbin,deg=deg,cov=True)
+    mask = np.where(~fsr_mask[o])[0]
 
+    wleft = wave_matrix[o,:,mask].flatten()
+    wbin = wave_bin[o,:,mask].flatten()
+
+    poly,cov = np.polyfit(wleft,wbin,deg=deg,cov=True)
     poly_std = [cov[j][j]**0.5 for j in range(deg+1)]
     wbin_fit = np.polyval(poly,wleft)
     chi = np.mean((wbin-wbin_fit)**2/0.00001**2)
@@ -169,15 +170,16 @@ for o in orders:
         continue
     #for j in range(deg+1):
     #    print("poly %d: %.2e +/- %.2e"%(j,poly[j],poly_std[j]))
-    wave_min[o] = wave_matrix[o,:,0].min()-0.01
-    wave_max[o] = wave_matrix[o,:,-1].max()+0.01
+    wave_min[o] = wave_matrix[o,:,mask[0]].min()-0.01
+    wave_max[o] = wave_matrix[o,:,mask[-1]].max()+0.01
     wave_poly[o] = poly
 
 config_file = "new_orders.config"
-file_content = ["#order wave_min wave_max wave_poly\n"]
+file_content = ["#order wave_min wave_max wave_poly n_bins\n"]
 for o in range(n_order):
+    n_bins = (~fsr_mask[o]).sum()+6
     polystr = " ".join(["%.7e"%item for item in wave_poly[o]])
-    text = "%d %.7f %.7f %s\n"%(o,wave_min[o],wave_max[o],polystr)
+    text = "%d %.7f %.7f %s %d\n"%(o,wave_min[o],wave_max[o],polystr,n_bins)
     file_content.append(text)
 with open(config_file,"w") as f:
     for line in file_content:
@@ -188,24 +190,28 @@ config_data = np.loadtxt(config_file).T
 wave_min = config_data[1]
 wave_max = config_data[2]
 wave_poly = config_data[3:6].T
+wave_bins = config_data[6]
 
 o = 61
-wleft = wave_matrix[o,:,:-1].flatten()
-wbin = wave_bin[o].flatten()
+mask = np.where(~fsr_mask[o])[0]
+print("good:",len(mask))
+wleft = wave_matrix[o,:,mask].flatten()
+wbin = wave_bin[o,:,mask].flatten()
 wbin_fit = np.polyval(wave_poly[o],wleft)
 chi = np.mean((wbin-wbin_fit)**2/0.00001**2)
 print("resid chi: %.2f"%chi)
-
-input_grid = get_wavelengths(wave_poly[o],wave_min[o],wave_max[o])
+input_grid = get_wavelengths(wave_poly[o],wave_min[o],wave_max[o],
+                             n_pix=wave_bins[o])
+print("input_grid:",len(input_grid))
 y_offset = 0.001
 fig,axs=plt.subplots(ncols=3,figsize=(10, 3),dpi=200,
                      constrained_layout=True)
 for i,obsname in enumerate(sample_names[:n_sample]):
-    wave_order = wave_matrix[o,i]
-    wleft = wave_order[:-1]
-    wbin = wave_bin[o,i]
+    wave_order = wave_matrix[o,i,mask]
+    wleft = wave_order
+    wbin = wave_bin[o,i,mask]
     for ax in axs[:2]:
-        ax.plot(wave_order,np.zeros((n_pix))+i*y_offset,".-",c=colors[i%len(colors)])
+        ax.plot(wave_order,np.zeros_like(wave_order)+i*y_offset,".-",c=colors[i%len(colors)])
     axs[2].plot(wleft,wbin,"-",c=colors[i%len(colors)])
 for ax in axs[:2]:
     ax.plot(input_grid,np.zeros_like(input_grid)-y_offset,".-",c="grey",label="merge grid")

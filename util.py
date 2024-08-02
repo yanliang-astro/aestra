@@ -10,10 +10,64 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 from itertools import chain
 import pickle, humanize, psutil, GPUtil, io, random
+from astropy.io import fits
 from torchinterp1d import Interp1d
 from torchcubicspline import natural_cubic_spline_coeffs
 from astropy.timeseries import LombScargle
 from spender_model import SpectrumAutoencoder
+
+# Normalize x to range [-1, 1] based on x_ref
+def normalize_x(x,x_ref):
+    x_min = x_ref.min()
+    x_max = x_ref.max()
+    x_normalized = 2 * (x - x_min) / (x_max - x_min) - 1
+    return x_normalized
+
+# Function to fit the cubic model using matrix inversion
+def fit_cubic_via_matrix_inversion(x_in, y, x_ref):
+    N_batch, N_data = y.shape
+    x = normalize_x(x_in,x_ref)
+    # Create Vandermonde matrix (N_data, 4)
+    X = torch.stack([x**3, x**2, x, torch.ones_like(x)], dim=-1)  
+    X_T = X.transpose(0, 1)  # Transpose of X (4, N_data)
+
+    # Perform batch-wise matrix multiplication and inversion
+    XTX = X_T @ X  # (4, 4)
+    XTX_inv = torch.inverse(XTX)  # (4, 4)
+    XTy = torch.einsum('ij,bj->bi', X_T, y)  # (N_batch, 4)
+    # Calculate coefficients using the normal equation
+    coefficients = torch.einsum('ij,bj->bi', XTX_inv, XTy)  # (N_batch, 4)
+    return coefficients
+
+# Function to evaluate the cubic model using the fitted coefficients
+def evaluate_cubic(x_in, coefficients, x_ref):
+    x = normalize_x(x_in,x_ref)
+    # Create Vandermonde matrix for evaluation points (N_data, 4)
+    X_eval = torch.stack([x**3, x**2, x, torch.ones_like(x)], dim=-1)
+    # Perform batched polynomial evaluation
+    y_eval = torch.einsum('bi,ij->bj', coefficients, X_eval.transpose(0, 1))
+    return y_eval
+
+def load_master_fsr_mask():
+    filename = "neidMaster_FSR_Mask20210218_v002.fits"
+    hdulist = fits.open(filename)
+    header = hdulist[0].header
+    fsr_mask = hdulist[0].data
+    fsr_mask = np.array(fsr_mask,dtype=bool)
+    return fsr_mask
+
+def normalize_residual_cubic(wave_obs,spectrum,weight,template):
+    # normalize input residual spectrum to zero
+    x = wave_obs.float()
+    spec_input = spectrum-template
+    n_order = wave_obs.shape[0]
+    for o in range(n_order):
+        bad = torch.any(weight[:,o,:]<1.0, dim=0)
+        coefficients = fit_cubic_via_matrix_inversion(x[o,~bad], spec_input[:,o,~bad],x[o])
+        y_eval = evaluate_cubic(x[o], coefficients,x[o])
+        spec_input[:,o,:] -= y_eval
+    spec_input[weight<1.0] = 0
+    return spec_input
 
 def normalize_residual(spectrum,weight,template):
     bad = weight<1.0
@@ -25,6 +79,12 @@ def normalize_residual(spectrum,weight,template):
     spec_input[bad] = 0
     return spec_input
 
+def divide_sky_model(spec,w,spec_sky,fringe_spec,template):
+    spec /= spec_sky # divide our telluric model
+    spec -= fringe_spec # subtract our fringe model
+    spec_input = normalize_residual(spec,w,template)
+    return spec_input
+
 def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,telluric_raw=1,aug=False,planetary_rv=0):
     wave_raw,spec_raw,w_raw,ssbrv = batch[:4]
     wave_obs = instrument.wave_obs
@@ -33,6 +93,7 @@ def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,tellur
     device = wave_obs.device
     template = template_data[1].repeat(n_batch,1,1)
 
+    if skymask==None:skymask=wave_obs<0
     # produce augmentation data -- inject rv offset
     if aug:
         z_lim = 5e-8 # 15 m/s
@@ -63,16 +124,17 @@ def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,tellur
     bad |= torch.roll(bad, -1, dims=2)
     bad |= torch.roll(bad, +1, dims=2)
     bad |= out
-    
-    weight[bad] = 1e-12
-    spectrum[bad] = 0.0
 
     if aug:
-        sigma = (weight.mean())**(-0.5)
+        sigma = 0.5*(weight[~bad].mean())**(-0.5)
         spec_noise = sigma*torch.normal(mean=0,std=1.0,size=spectrum.shape,
                                         device=device)
         spectrum += spec_noise
 
+    weight[bad] = 1e-12
+    spectrum[bad] = 0.0
+    weight[:,skymask] = 1e-12
+    spectrum[:,skymask] = 0
     return spectrum, weight, z_offset
 
 
@@ -137,11 +199,8 @@ def cubic_evaluate(coeffs, tnew):
     return a[batch_ind, index] + inner * fractional_part
 
 def cubic_transform(xrest, yrest, wave_shifted):
-    #wave_shifted = - xobs * z + xobs
-    #print("xrest:",xrest.shape,"yrest:",yrest.shape)
     coeffs = natural_cubic_spline_coeffs(xrest, yrest.unsqueeze(-1))
     out = cubic_evaluate(coeffs, wave_shifted)
-    #print("out:",out.shape)
     return out
 
 def moving_mean(x,y,w=None,n=20,skip_weight=True):
@@ -154,13 +213,15 @@ def moving_mean(x,y,w=None,n=20,skip_weight=True):
     for i,xmid in enumerate(xgrid):
         mask = x>(xmid-dx)
         mask *= x<(xmid+dx)
+        if mask.sum()<5:
+            non_zero[i] = False
+            continue
         if skip_weight:
-            if mask.sum()<50:
-                non_zero[i] = False
-                continue
             ygrid[i] = np.mean(y[mask])
             delta_y[i] = y[mask].std()/np.sqrt(mask.sum())
         else:
+            if w[mask].sum()==0:
+                print(w[mask])
             ygrid[i] = np.average(y[mask],weights=w[mask])
             delta_y[i] = np.sqrt(np.cov(y[mask], aweights=w[mask]))/np.sqrt(mask.sum())
     return xgrid[non_zero],ygrid[non_zero],delta_y[non_zero]
@@ -178,32 +239,26 @@ def moving_median(x,y,n=20):
         delta_y[i] = y[mask].std()/np.sqrt(mask.sum())
     return xgrid,ygrid,delta_y
 
-def plot_fft(timestamp,signals,fname,labels,period=100,fs=14):
-    cs = ["grey","k","b","r"]
+def plot_fft(timestamp,signals,fname,labels,period=100,fs=14,period_max = 1000):
+    cs = ["k","b","r"]
     alphas = [1,1,1,0.7]
     lw = [2,2,2,2]
-    fig,ax = plt.subplots(figsize=(4,2.5),constrained_layout=True)
-    pmax=0
+    fig,ax = plt.subplots(figsize=(5,3),constrained_layout=True)
+
     for i,ts in enumerate(signals[:len(cs)]):
-        if "encode" in labels[i]:continue
-        if "doppler" in labels[i]:continue
         frequency, power = LombScargle(timestamp, ts).autopower()
         p_axis = 1.0/frequency
         # Plot the result
         ax.plot(p_axis,power, c=cs[i],lw=lw[i],label="%s"%(labels[i]), alpha=alphas[i])
-        if power.max()>pmax: pmax = power.max()
+        mask = p_axis<period_max
+        rank = np.argsort(power[mask])[::-1]
+        print(labels[i],"peaks:",p_axis[mask][rank[:5]])
+    pmax = power[mask].max()
     ax.set_xlim(1,299)
-    ax.set_ylim(0,1.1*pmax)
+    ax.set_ylim(0,0.12)
     ax.set_xlabel('Period [days]');ax.set_ylabel('Power')
     ax.axvline(period,ls="--",c="grey",zorder=-10,label="$P_{true}$")
-    if "uniform" in fname:
-        ax.set_yticks([0.01,0.02,0.03])
-        title = r"$\mathbf{Case\ I \ (N=1000)}$"
-    elif "dynamic" in fname:
-        ax.set_yticks([0.05,0.10,0.15,0.20])
-        title = r"$\mathbf{Case\ II \ (N=200)}$"
-    else:title="test"
-    ax.legend(fontsize=fs,title=title)
+    ax.legend(fontsize=fs)
     plt.savefig("[%s]periodogram.png"%fname,dpi=300)
     #with open("results-%s.pkl"%fname,"wb")  as f:
     #    pickle.dump(signals,f)
