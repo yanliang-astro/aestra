@@ -142,7 +142,12 @@ class RVEstimator(nn.Module):
                  act=(nn.PReLU(128),nn.PReLU(64),nn.PReLU(32), nn.Identity()),
                  dropout=0):
         super(RVEstimator, self).__init__()
-        n_order,n_in = input_shape
+
+        if len(input_shape)==2:
+            n_order,n_in = input_shape
+        else:
+            n_order=1
+            n_in = input_shape[0]
 
         filters = [n_order,128,64]
         self.conv1,self.conv2 = self._conv_blocks(filters, sizes, dropout=dropout)
@@ -173,6 +178,7 @@ class RVEstimator(nn.Module):
         return tuple(convs)
 
     def forward(self, x):
+        return torch.zeros((x.shape[0],1),device=x.device)
         # compression
         x = self.pool1(self.conv1(x))
         x = self.pool2(self.conv2(x))
@@ -204,10 +210,12 @@ class SpectrumEncoder(nn.Module):
         self.instrument = instrument
         self.n_latent = n_latent
         self.n_aux = n_aux
-        self.n_order = instrument.wave_obs.shape[0]
+        if instrument.wave_obs.ndim==2:
+            self.n_order = instrument.wave_obs.shape[0]
+        else: self.n_order = 1
 
-
-        filters = [self.n_order, 128, 256, 512]
+        #filters = [self.n_order, 128, 256, 512]
+        filters = [self.n_order, 64, 128, 256]
         sizes = [5, 11, 21]
         self.conv1, self.conv2, self.conv3 = self._conv_blocks(filters, sizes, dropout=dropout)
         self.n_feature = filters[-1] // 2
@@ -278,12 +286,17 @@ class FringeModel(nn.Module):
                 ):
 
         super(FringeModel, self).__init__()
+        if instrument.wave_obs.ndim==2:
+            n_channel,n_spec = instrument.wave_obs.shape
+        else:
+            n_channel=1
+            n_spec = instrument.wave_obs.shape[0]
 
         x = instrument.wave_obs
         x_min,x_max = x.min(),x.max()
         x_normalized = x - (x_max + x_min)/2
-        n_channel,n_spec = x.shape
 
+        x_fringe = torch.linspace(x_min,x_max,n_knot)
         self.n_latent = n_latent
         self.n_knot = n_knot
         self.n_sin = n_sin
@@ -291,6 +304,7 @@ class FringeModel(nn.Module):
         self.scale = fringe_scale
         self.phi = fringe_phase
         self.register_buffer('x', x_normalized)
+        self.register_buffer('x_fringe', x_fringe)
         self.encoder = SpectrumEncoder(instrument, n_latent)
         self.decoder = MultipleMLP(n_latent,n_knot+n_sin,
                                    act=(nn.LeakyReLU(), nn.LeakyReLU(), nn.LeakyReLU(), nn.Identity()),
@@ -321,27 +335,15 @@ class FringeModel(nn.Module):
     def decode(self, x):
         return self.decoder(x)
 
-    def sinusoid(self, params):
-        # Reshape x_vals to (1, N_channel, 1000) for broadcasting
-        x_vals = self.x.unsqueeze(0)  # (1, N_channel, 1000)
-
-        # Extract parameters and reshape them for broadcasting
-        A = params[:, :, 0].unsqueeze(-1)
-        w0 = params[:, :, 1].unsqueeze(-1)
-        phase = params[:, :, 2].unsqueeze(-1) + self.phi
-        a1 = params[:, :, 3].unsqueeze(-1)
-
-        A = torch.abs(A)
-        # Calculate the angular frequency
-        w = 2.0*torch.pi/self.L + w0 + a1 * x_vals
-        # Calculate the modified sinusoid
-        return self.scale*A*torch.sin(w * x_vals + phase)
-
     def polynomial(self,s):
         return self.lagrange_polynomial(s)
 
     def cubic_interpolation(self,y_knot,z):
-        n_order,n_spec = self.x.shape
+        if self.x.ndim==2:
+            n_order,n_spec = self.x.shape
+        else:
+            n_order = 1
+            n_spec = self.x.shape[0]
         x_knot = torch.linspace(-1,1,self.n_knot,device=y_knot.device)
         x_eval = torch.linspace(-1,1,n_spec,device=y_knot.device)
         x_eval = x_eval.repeat(y_knot.size(0),1)
@@ -362,24 +364,24 @@ class TelluricModel(nn.Module):
                  wave_rest,
                  instrument,
                  n_decoder=6,
-                 joint_model=False,
                 ):
 
         super(TelluricModel, self).__init__()
-        n_channel,n_spec = instrument.wave_obs.shape
+        if instrument.wave_obs.ndim==2:
+            n_channel,n_spec = instrument.wave_obs.shape
+        else:
+            n_channel=1
+            n_spec = instrument.wave_obs.shape[0]
+
         n_latent = n_decoder
         self.n_latent = n_latent
         self.n_decoder = n_decoder
         self.instrument = instrument
         self.encoder = SpectrumEncoder(instrument, n_latent)
-        if joint_model:
-            self.decoder = MLP(n_decoder,wave_rest.shape[0],
-                               n_hidden=(),act=(nn.Identity(),))
-        else: 
-            self.decoder = MultipleMLP(n_decoder,n_spec,
-                                       n_channel=n_channel,
-                                       n_hidden=(),
-                                       act=(nn.Identity(),))
+        self.decoder = MultipleMLP(n_decoder,n_spec,
+                                   n_channel=n_channel,
+                                   n_hidden=(),
+                                   act=(nn.Identity(),))
         self.lsf = None
         self.register_buffer('wave_rest', wave_rest)
         # initialize weights to avoid large fluctuation
@@ -397,6 +399,7 @@ class TelluricModel(nn.Module):
         return x
 
     def forward(self, s, z, wave, skymask):
+        if s is None: return 1.0
         x = self.decode(s)
         if skymask is not None: x[:,~skymask] = 0
         x = 1.0 - self.transform(x,z,wave)
@@ -409,7 +412,12 @@ class TelluricModel(nn.Module):
 
     def transform(self, spectrum_restframe, z, wave):
         n_batch = spectrum_restframe.shape[0]
-        n_order,n_spec = wave.shape
+        #n_order,n_spec = wave.shape
+        if wave.ndim==2:n_order,n_spec = wave.shape
+        else:
+            n_order = 1
+            n_spec = wave.shape[0]
+        if z.ndim==1:z = z.unsqueeze(1)
         xx = self.wave_rest.repeat(n_batch,1,1)
         spectrum = torch.zeros((n_batch,n_order,n_spec),device=wave.device)
         for i in range(n_order):
@@ -440,6 +448,7 @@ class SpectrumDecoder(MultipleMLP):
             act = [nn.LeakyReLU() for i in range(len(n_hidden))]
             # Last layer should allow negative outputs
             act.append(nn.PReLU())
+            #act.append(nn.Identity())
 
         super(SpectrumDecoder, self).__init__(
             n_latent,
@@ -459,15 +468,24 @@ class SpectrumDecoder(MultipleMLP):
         self.register_buffer('wave_rest', wave_rest)
         self.register_buffer('weight_rest', weight_rest)
 
+
     def decode(self, s):
-        x = super().forward(s)
+        x = 1e-2*super().forward(s)
         return x
 
     def forward(self, s):
         return self.decode(s)
 
     def transform(self, spectrum_restframe, z, wave):
-        if wave.ndim==2:
+        if wave.ndim==1:
+            n_batch = spectrum_restframe.shape[0]
+            n_spec = wave.shape[0]
+            xx = self.wave_rest.repeat(n_batch,1)
+            wave_redshifted = - wave * z + wave
+            spectrum = Interp1d()(xx, spectrum_restframe[:,0,:], wave_redshifted)
+            spectrum = spectrum.unsqueeze(1)
+
+        elif wave.ndim==2:
             n_batch = spectrum_restframe.shape[0]
             n_order,n_spec = wave.shape
             xx = self.wave_rest.repeat(n_batch,1,1)
@@ -533,8 +551,13 @@ class BaseAutoencoder(nn.Module):
 
         if self.decoder.spec_rest == None: baseline = 1.0
         else: baseline = self.decoder.spec_rest
-        spectrum_activity = self.decode(s_star)
-        spectrum_restframe = baseline+spectrum_activity
+        if s_star is not None:
+            spectrum_activity = self.decode(s_star)
+            spectrum_restframe = baseline+spectrum_activity
+        else:
+            spectrum_restframe = baseline.repeat(z.shape[0],1,1)
+            spectrum_activity = torch.zeros_like(spectrum_restframe)
+
         spectrum_observed = self.decoder.transform(spectrum_restframe, z, instrument.wave_obs)
 
         return spectrum_activity, spectrum_restframe, spectrum_observed

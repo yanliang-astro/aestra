@@ -49,7 +49,7 @@ def evaluate_cubic(x_in, coefficients, x_ref):
     return y_eval
 
 def load_master_fsr_mask():
-    filename = "neidMaster_FSR_Mask20210218_v002.fits"
+    filename = "/scratch/gpfs/yanliang/headers/neidMaster_FSR_Mask20210218_v002.fits"
     hdulist = fits.open(filename)
     header = hdulist[0].header
     fsr_mask = hdulist[0].data
@@ -69,25 +69,52 @@ def normalize_residual_cubic(wave_obs,spectrum,weight,template):
     spec_input[weight<1.0] = 0
     return spec_input
 
+# Define a 1D Gaussian kernel with standard deviation sigma
+def gaussian_kernel_1d(size = 3, sigma = 1, device=None):
+    kernel_1d = torch.linspace(-(size // 2), size // 2, size, device=device)
+    kernel_1d = torch.exp(-0.5 * (kernel_1d / sigma) ** 2)
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    kernel_1d = kernel_1d.view(1, 1, -1)  # Shape: (out_channels, in_channels, kernel_size)
+    return kernel_1d
+
 def normalize_residual(spectrum,weight,template):
-    bad = weight<1.0
-    # normalize input residual spectrum to zero
     spec_input = spectrum-template
+
+    bad = (weight<1.0)|(spec_input.abs()>0.2)
+    # normalize input residual spectrum to zero
+
     spec_input[bad] = 0
     spec_mean = spec_input.sum(dim=2)/(~bad).sum(dim=2)
     spec_input -= spec_mean[:,:,None]
     spec_input[bad] = 0
+    # Generate the Gaussian kernel
+    gaussian_kernel = gaussian_kernel_1d(device=template.device)
+    # Apply 1D convolution
+    spec_input = F.conv1d(spec_input, gaussian_kernel, padding=1)  # Padding to keep the output size the same
     return spec_input
 
 def divide_sky_model(spec,w,spec_sky,fringe_spec,template):
-    spec /= spec_sky # divide our telluric model
-    spec -= fringe_spec # subtract our fringe model
-    spec_input = normalize_residual(spec,w,template)
-    return spec_input
+    spec_norm = spec / spec_sky # divide our telluric model
+    spec_norm -= fringe_spec # subtract our fringe model
+    spec_input = normalize_residual(spec_norm,w,template)
 
-def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,telluric_raw=1,aug=False,planetary_rv=0):
+    sky_var = (0.1*(1-spec_sky))**2
+    w_new = 1/(1/w+sky_var)
+
+    dispersion = spec_input.std(axis=0)
+    outlier = spec_input.abs()>4*dispersion
+    spec_input[outlier] = 0
+    w_new[outlier] = 1e-12
+    return spec_input,w_new
+
+def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,aug=False,planetary_rv=0.):
     wave_raw,spec_raw,w_raw,ssbrv = batch[:4]
     wave_obs = instrument.wave_obs
+    if spec_raw.ndim == 2:
+        wave_raw = wave_raw.unsqueeze(1)
+        spec_raw = spec_raw.unsqueeze(1)
+        w_raw = w_raw.unsqueeze(1)
+
     n_order,n_spec = wave_obs.shape
     n_batch = spec_raw.shape[0]
     device = wave_obs.device
@@ -97,7 +124,7 @@ def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,tellur
     # produce augmentation data -- inject rv offset
     if aug:
         z_lim = 5e-8 # 15 m/s
-        #z_lim = 1e-8 # 3 m/s
+        #z_lim = 3e-8 # 9 m/s
         z_offset = z_lim*(torch.rand(n_batch,1, device=device)-0.5)
     else: z_offset = 0
 
@@ -119,6 +146,7 @@ def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,tellur
     ill = (template==0)|(spectrum==0)|(weight<1.0)
     # mask out +/- 1 pixel of bad input data (zero flux)
     bad = (spectrum<(template*0.6))|ill
+
     # after linear interpolation, bad flux values are at most half of template values
     # cut at 0.6 for safety
     bad |= torch.roll(bad, -1, dims=2)
@@ -176,9 +204,9 @@ def load_model(path, instrument, device):
     model.eval()
     return model,mdict["losses"],n_latent
 
-def simulate_planet(t,amp=1,period=0.11,t0=0):
-    phase = ((t/period)-t0)%1
-    v_planet = amp*torch.sin(2*np.pi*phase)[:,None]
+def simulate_planet(t,amp=1,period=0.11,phase_t0=0):
+    phase = ((t/period)-phase_t0)%1
+    v_planet = amp*torch.sin(2*np.pi*phase)#[:,None]
     return phase,v_planet
 
 def cubic_evaluate(coeffs, tnew):
@@ -239,41 +267,6 @@ def moving_median(x,y,n=20):
         delta_y[i] = y[mask].std()/np.sqrt(mask.sum())
     return xgrid,ygrid,delta_y
 
-def plot_fft(timestamp,signals,fname,labels,period=100,fs=14,period_max = 1000):
-    cs = ["k","b","r"]
-    alphas = [1,1,1,0.7]
-    lw = [2,2,2,2]
-    fig,ax = plt.subplots(figsize=(5,3),constrained_layout=True)
-
-    for i,ts in enumerate(signals[:len(cs)]):
-        frequency, power = LombScargle(timestamp, ts).autopower()
-        p_axis = 1.0/frequency
-        # Plot the result
-        ax.plot(p_axis,power, c=cs[i],lw=lw[i],label="%s"%(labels[i]), alpha=alphas[i])
-        mask = p_axis<period_max
-        rank = np.argsort(power[mask])[::-1]
-        print(labels[i],"peaks:",p_axis[mask][rank[:5]])
-    pmax = power[mask].max()
-    ax.set_xlim(1,299)
-    ax.set_ylim(0,0.12)
-    ax.set_xlabel('Period [days]');ax.set_ylabel('Power')
-    ax.axvline(period,ls="--",c="grey",zorder=-10,label="$P_{true}$")
-    ax.legend(fontsize=fs)
-    plt.savefig("[%s]periodogram.png"%fname,dpi=300)
-    #with open("results-%s.pkl"%fname,"wb")  as f:
-    #    pickle.dump(signals,f)
-    #    pickle.dump(labels,f)
-    return
-
-def plot_sphere(pos,radius,ax,c="grey",alpha=0.5,zorder=0):
-    u = np.linspace(0, 2 * np.pi, 100)
-    v = np.linspace(0, np.pi, 100)
-    x = radius * np.outer(np.cos(u), np.sin(v)) + pos[0]
-    y = radius * np.outer(np.sin(u), np.sin(v)) + pos[1]
-    z = radius* np.outer(np.ones(np.size(u)), np.cos(v)) + pos[2]
-    # Plot the surface
-    ax.plot_surface(x, y, z, alpha=alpha, zorder=zorder,color=c)
-    return
 
 def density_plot(points,bins=30):
     x,y,z = points

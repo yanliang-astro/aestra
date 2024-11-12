@@ -205,8 +205,8 @@ def prepare_spectrum(obsname,fsr_mask):
         spectrum_err[k][~isnan] = normflux_err[~isnan]
         spectrum_err[k][isnan] = large_number
 
-    badmask = detect_bad_pixel([wavelength,spectrum,spectrum_err])
-    spectrum_err[badmask] = large_number
+    #badmask = detect_bad_pixel([wavelength,spectrum,spectrum_err])
+    #spectrum_err[badmask] = large_number
     return [wavelength,spectrum,spectrum_err],info_dict
 
 def save_batch(wave,specs,w,ssbrv,IDs,filename):
@@ -256,6 +256,10 @@ def make_batch(sample_names,max_neg_flux=100,max_wave_std=0.0005):
         wavemat[i_obs,:,:] = wavelength
         specmat[i_obs,:,:] = spectrum
         errmat[i_obs,:,:] = spectrum_err
+
+    flux_mean = np.mean(specmat,axis=0,keepdims=True)
+    flux_std = specmat.std(axis=0,keepdims=True)
+    flux_diff = (specmat-flux_mean)/flux_std
 
     wave_mean = np.mean(wavemat,axis=0,keepdims=True)
     wave_std = (wavemat-wave_mean).std(axis=-1)
@@ -339,7 +343,7 @@ def process_task(args, mdict):
         print("mdict:",n_items)
     return
 
-def wrap_data(sample_names,datatag,batch_size):
+def wrap_data(sample_names,datatag,batch_size,order_value):
     idx = np.arange(0, len(sample_names), batch_size)
     batches = np.array_split(sample_names, idx[1:])
     file_batches = ["%s/%s_%d.pkl"%(dynamic_dir,datatag,k) for k in range(len(batches))]
@@ -540,13 +544,10 @@ def detect_bad_pixel(data,sigma=1.5,snr=3,radius=2):
 def preview_spectrum(obsname,fsr_mask=[]):
     data,info_dict = prepare_spectrum(obsname,fsr_mask)
     wavelength,spectrum,spectrum_err = data
-    spec_smooth = gaussian_filter1d(spectrum, 1.5)
-
-    ydiff = np.abs(spectrum-spec_smooth)/spectrum_err
-    ydiff /= ydiff.max()
+    #spec_smooth = gaussian_filter1d(spectrum, 1.5)
 
     nrows=len(order_value)
-    ylim=[0,1.2]
+    ylim=[0,max(1.2,spectrum.max())]
     fig, axs = plt.subplots(figsize=(15,nrows*2.5),nrows=nrows,dpi=200,constrained_layout=True)
     if nrows==1:axs=[axs]
     for i,ax in enumerate(axs):
@@ -607,7 +608,7 @@ parser = argparse.ArgumentParser(description='Description of your script')
 # Define optional arguments with default values
 parser.add_argument('-t', '--tag', help='Tag description', default='test')
 parser.add_argument('-n', '--samples', type=int, help='Number of samples', default=100)
-parser.add_argument('-batch', '--batch_size', type=int, help='Batch size', default=500)
+parser.add_argument('-batch', '--batch_size', type=int, help='Batch size', default=5000)
 parser.add_argument('-cpu', '--num_cores', type=int, help='Number of CPU cores', default=10)
 parser.add_argument('-load', '--load_data', action='store_true', help='Load data')
 parser.add_argument('-o','--orders', nargs='+', help='<Required> Orders', required=True)
@@ -636,7 +637,7 @@ N_SPEC = input_wave.shape[-1] - 6
 print("input_wave:",input_wave.shape)
 datatag = "%s_N%d"%(tag,n_sample)
 
-file_path = "NEID_QUIET_OBSNAME.txt"
+file_path = "/scratch/gpfs/yanliang/headers/NEID_QUIET_OBSNAME.txt"
 # Load the data from the text file
 data = np.loadtxt(file_path, dtype={'names': ('filename', 'jd', 'ccfrv'), 'formats': ('S30', 'f8', 'f8')})
 
@@ -658,20 +659,19 @@ sample_names = list(neid_filenames[sel])
 print("order:",order_value)
 print("sample_names:",len(sample_names))
 
-#preview_spectrum("neidL2_20211109T204628.fits",fsr_mask=fsr_mask)
+preview_spectrum("neidL2_20211109T204628.fits",fsr_mask=fsr_mask)
 #preview_spectrum("neidL2_20220416T185324.fits")
 #exit()
 n_order = input_wave.shape[0]
 
 if not load_data:
-    sample_names = wrap_data(sample_names,datatag,batch_size)
+    sample_names = wrap_data(sample_names,datatag,batch_size,order_value)
     calculate_v_template(sample_names,datatag)
 
-with open("skymask.pkl","rb") as f:
-    skymask = pickle.load(f)
-    save_auxfile(skymask,"%s/%s-skymask.pkl"%(dynamic_dir,datatag))
+#with open("skymask.pkl","rb") as f:
+#    skymask = pickle.load(f)
+#    save_auxfile(skymask,"%s/%s-skymask.pkl"%(dynamic_dir,datatag))
 
-exit()
 print("Loading from %s-param.pkl"%datatag)
 with open("%s-param.pkl"%datatag,"rb") as f:
     neid_dict = pickle.load(f)
@@ -812,12 +812,12 @@ dispersion[np.isnan(dispersion)] = 0
 rank = np.argsort(base_chi_order[0])[::-1]
 i_plots = rank[:10]
 
-cmap = get_cmap('Greys')
+cmap = get_cmap('plasma')
 tmin,tmax = min(timestamp[i_plots]),max(timestamp[i_plots])
 colors =[cmap((t-tmin)/(tmax-tmin)) for t in timestamp[i_plots]]
 
-mask = np.arange(0,800)
-#mask = np.arange(0,N_SPEC)
+#mask = np.arange(0,800)
+mask = np.arange(0,N_SPEC)
 ncols = min(3,len(order_value))
 nrows = max(n_order//ncols,1)
 fig,axs = plt.subplots(nrows=nrows,ncols=ncols,figsize=(15,4*nrows),constrained_layout=True)
@@ -841,12 +841,12 @@ for i_order,o in enumerate(order_value):
         text = "%.2f $v_{CCF}$:%.2f m/s $\chi^2=%.2f$"%(neid_dict[obsname]['timestamp'],ccfrv,base_chi[i_obs])
         print(text,obsname)
         ax.plot(wave_raw[i_obs][i_order][mask], spec_raw[i_obs][i_order][mask],drawstyle="steps-mid",alpha=1.0,
-                c=colors[i_image])#,label=text)
+                c=colors[i_image],label=text)
 
         i_image += 1
     ax.plot(input_wave[i_order][mask],baseline[i_order][mask],"r-")
     #wh = np.argmax(dispersion[i_order])
-    ax.set_ylim(0.8,1.06)
+    #ax.set_ylim(0.8,1.06)
     #ax.set_xlim(wave_mean[i_order][0],wave_mean[i_order][0]+5)
     ax.set_ylabel("normalized flux")
     ax.legend(loc="lower left")
