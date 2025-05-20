@@ -70,7 +70,8 @@ def normalize_residual_cubic(wave_obs,spectrum,weight,template):
     return spec_input
 
 # Define a 1D Gaussian kernel with standard deviation sigma
-def gaussian_kernel_1d(size = 3, sigma = 1, device=None):
+def gaussian_kernel_1d(sigma = 20, device=None):
+    size = 2*sigma + 1
     kernel_1d = torch.linspace(-(size // 2), size // 2, size, device=device)
     kernel_1d = torch.exp(-0.5 * (kernel_1d / sigma) ** 2)
     kernel_1d = kernel_1d / kernel_1d.sum()
@@ -78,7 +79,8 @@ def gaussian_kernel_1d(size = 3, sigma = 1, device=None):
     return kernel_1d
 
 def normalize_residual(spectrum,weight,template):
-    spec_input = spectrum-template
+    #template[template==0] = 1
+    spec_input = spectrum - template #- 1
 
     bad = (weight<1.0)|(spec_input.abs()>0.2)
     # normalize input residual spectrum to zero
@@ -87,11 +89,19 @@ def normalize_residual(spectrum,weight,template):
     spec_mean = spec_input.sum(dim=2)/(~bad).sum(dim=2)
     spec_input -= spec_mean[:,:,None]
     spec_input[bad] = 0
+    '''
     # Generate the Gaussian kernel
-    gaussian_kernel = gaussian_kernel_1d(device=template.device)
+    gaussian_kernel = gaussian_kernel_1d(sigma=20, device=template.device)
     # Apply 1D convolution
-    spec_input = F.conv1d(spec_input, gaussian_kernel, padding=1)  # Padding to keep the output size the same
-    return spec_input
+    spec_input -= F.conv1d(spec_input, gaussian_kernel, padding=20)  # Padding to keep the output size the same
+
+    pixel_diff = torch.zeros_like(weight)
+    pixel_diff[:,:,:-1] = torch.abs(spec_input[:,:,:-1]-spec_input[:,:,1:])/np.sqrt(2)
+    pixel_diff[:,:,-1] = pixel_diff[:,:,-2]
+    pixel_diff= torch.maximum(pixel_diff,weight**(-0.5))
+    w_jitter = 1/(pixel_diff**2)
+    '''
+    return spec_input,w_jitter
 
 def divide_sky_model(spec,w,spec_sky,fringe_spec,template):
     spec_norm = spec / spec_sky # divide our telluric model
@@ -107,7 +117,57 @@ def divide_sky_model(spec,w,spec_sky,fringe_spec,template):
     w_new[outlier] = 1e-12
     return spec_input,w_new
 
-def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,aug=False,planetary_rv=0.):
+def interpolate_to_input_grid(batch,instrument,template_data,aug=False,extra_rv=0.):
+    _,spec_raw,w,ssbrv,jd = batch
+    #wave_raw,spec_raw,w_raw,ssbrv = batch[:4]
+    n_batch,n_spec = spec_raw.shape
+    device = spec_raw.device
+    template = template_data[1].repeat(n_batch,1)
+    wave_obs = instrument.wave_obs[0]
+    wave_raw = wave_obs.repeat(n_batch,1)
+
+    # produce augmentation data -- inject rv offset
+    if aug:
+        z_lim = 5e-8 # 15 m/s
+        z_offset = z_lim*(torch.rand(n_batch,1, device=device)-0.5)
+    else: z_offset = torch.zeros(n_batch,1, device=device)
+
+    # total rv = ssbrv + injected extra_rv + rv offset
+    z = (extra_rv)/instrument.c + z_offset
+
+    #spectrum = torch.zeros((n_batch,n_spec),device=device)
+    #weight = torch.zeros((n_batch,n_spec),device=device)
+    wave = wave_raw + wave_raw * z
+    #out = torch.zeros_like(spectrum,dtype=bool)
+
+    spectrum = Interp1d()(wave, spec_raw+template, wave_obs)
+    weight = Interp1d()(wave, w, wave_obs)
+    wmin = wave.min(dim=1)[0]
+    wmax = wave.max(dim=1)[0]
+    out_ = (wave_obs<wmin.unsqueeze(1))|(wave_obs>wmax.unsqueeze(1))
+    out = out_
+    ill = (template==0)|(spectrum==0)|(weight<1.0)
+    # mask out +/- 1 pixel of bad input data (zero flux)
+    bad = (spectrum<(template*0.6))|ill
+
+    # after linear interpolation, bad flux values are at most half of template values
+    # cut at 0.6 for safety
+    bad |= torch.roll(bad, -1, dims=1)
+    bad |= torch.roll(bad, +1, dims=1)
+    bad |= out
+
+    if aug:
+        sigma = weight**(-0.5)
+        spec_noise = sigma*torch.normal(mean=0,std=1.0,size=spectrum.shape,
+                                        device=device)
+        spectrum += spec_noise
+
+    spec_input = spectrum - template
+    weight[bad] = 1e-12
+    spec_input[bad] = 0.0
+    return spec_input.float(), weight.float(), z_offset
+
+def interpolate_to_input_grid_old(batch,instrument,template_data,skymask=None,aug=False,extra_rv=0.):
     wave_raw,spec_raw,w_raw,ssbrv = batch[:4]
     wave_obs = instrument.wave_obs
     if spec_raw.ndim == 2:
@@ -128,8 +188,8 @@ def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,aug=Fa
         z_offset = z_lim*(torch.rand(n_batch,1, device=device)-0.5)
     else: z_offset = 0
 
-    # total rv = ssbrv + injected planetary_rv + rv offset
-    z = (ssbrv+planetary_rv)/instrument.c + z_offset
+    # total rv = ssbrv + injected extra_rv + rv offset
+    z = (ssbrv+extra_rv)/instrument.c + z_offset
 
     spectrum = torch.zeros((n_batch,n_order,n_spec),device=device)
     weight = torch.zeros((n_batch,n_order,n_spec),device=device)
@@ -159,11 +219,13 @@ def interpolate_to_input_grid(batch,instrument,template_data,skymask=None,aug=Fa
                                         device=device)
         spectrum += spec_noise
 
+
     weight[bad] = 1e-12
     spectrum[bad] = 0.0
     weight[:,skymask] = 1e-12
     spectrum[:,skymask] = 0
     return spectrum, weight, z_offset
+    #return spectrum
 
 
 def merge_batch(file_batches):
@@ -192,12 +254,15 @@ def load_model(path, instrument, device):
     model_dict = mdict['model'][0]
     wave_rest = model_dict['decoder.wave_rest']
     spec_rest = model_dict['decoder.spec_rest']
+
+    n_pl,n_param=model_dict['activity_estimator.planet_params'].shape
     n_latent = 3#len(model_dict['encoder.mlp.mlp.9.bias'])
 
     model = SpectrumAutoencoder(instrument,
                                 wave_rest=wave_rest,
                                 spec_rest=spec_rest,
                                 n_latent=n_latent,
+                                planet_params=np.zeros((n_pl,n_param)),
                                 normalize=False)
     model.load_state_dict(mdict["model"][0],strict=False)
     model.to(device)

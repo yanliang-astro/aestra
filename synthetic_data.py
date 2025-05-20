@@ -28,7 +28,7 @@ class Synthetic(Instrument):
         else:
             subset = None
         load_fct = partial(load_batch, subset=subset)
-        data = BatchedFilesDataset(files, load_fct, shuffle=shuffle)
+        data = BatchedFilesDataset(files, load_fct, shuffle=shuffle, shuffle_instance=shuffle)
         return DataLoader(data, batch_size=batch_size)
 
     @classmethod

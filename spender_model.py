@@ -84,20 +84,45 @@ class ParallelMLP(nn.Module):
         x = torch.cat(x,dim=1)
         return x
 
+def simulate_planet(t,amp=1,period=0.11,phase_t0=0):
+    if period==0: return None,torch.zeros_like(t)
+    phase = ((t/period)-phase_t0)%1
+    v_planet = amp*torch.sin(2*np.pi*phase)
+    return phase,v_planet
+
 #### MLP which infers activity RV from latent vectors ####
 class ActivityEstimator(nn.Module):
     def __init__(self,
                  n_in,
-                 n_hidden=(16, 16, 16),
-                 act=(nn.LeakyReLU(), nn.LeakyReLU(), nn.LeakyReLU(), nn.Identity()),
+                 n_out=1,
+                 n_channel=1,
+                 n_hidden=(2,),
+                 planet_params=None,
+                 act=(nn.PReLU(), nn.Identity()),
+                 n_planet=15,
                  dropout=0):
         super(ActivityEstimator, self).__init__()
-        n_out = 1
+
         self.mlp = MLP(n_in,n_out,n_hidden=n_hidden,act=act,dropout=dropout)
+        # Initialize additional trainable parameters
+        if planet_params is not None:
+            n_fill = min(n_planet,len(planet_params))
+            init = torch.zeros((n_planet,3))
+            init[:n_fill] = torch.from_numpy(planet_params[:n_fill])
+            self.planet_params = nn.Parameter(init)
 
     def forward(self, x):
         x = self.mlp(x)
         return x
+
+    def doppler_rv(self,t):
+        n_planet,n_param = self.planet_params.shape
+        v_doppler = torch.zeros((n_planet,t.shape[0]),device=t.device)
+        for i in range(n_planet):
+            amp,per,ph = self.planet_params[i]
+            _, v = simulate_planet(t,amp,per,ph)
+            v_doppler[i] = v[:,0]
+        return v_doppler
 
 class SpeculatorActivation(nn.Module):
     """Activation function from the Speculator paper
@@ -139,7 +164,7 @@ class RVEstimator(nn.Module):
                  input_shape,
                  sizes = [5,10],
                  n_hidden=(128, 64, 32),
-                 act=(nn.PReLU(128),nn.PReLU(64),nn.PReLU(32), nn.Identity()),
+                 act=(nn.PReLU(128),nn.PReLU(64),nn.PReLU(32), nn.PReLU()),
                  dropout=0):
         super(RVEstimator, self).__init__()
 
@@ -155,7 +180,7 @@ class RVEstimator(nn.Module):
 
         self.pool1, self.pool2 = tuple(nn.MaxPool1d(s) for s in sizes[:2])
         print("self.n_feature:",self.n_feature)
-        self.mlp = MLP(self.n_feature, 1, n_hidden=n_hidden, act=act, dropout=dropout)
+        self.mlp = MLP(self.n_feature, 2, n_hidden=n_hidden, act=act, dropout=dropout)
         self.flatten = nn.Flatten()
         self.softmax = nn.Softmax(dim=-1)
 
@@ -178,7 +203,7 @@ class RVEstimator(nn.Module):
         return tuple(convs)
 
     def forward(self, x):
-        return torch.zeros((x.shape[0],1),device=x.device)
+        if x.ndim==2:x = x.unsqueeze(1)
         # compression
         x = self.pool1(self.conv1(x))
         x = self.pool2(self.conv2(x))
@@ -247,7 +272,7 @@ class SpectrumEncoder(nn.Module):
 
     def _downsample(self, x):
         # compression
-        #x = x.unsqueeze(1)
+        if x.ndim==2:x = x.unsqueeze(1)
         x = self.pool1(self.conv1(x))
         x = self.pool2(self.conv2(x))
         x = self.conv3(x)
@@ -471,6 +496,7 @@ class SpectrumDecoder(MultipleMLP):
 
     def decode(self, s):
         x = 1e-2*super().forward(s)
+        if x.shape[1]==1:x = x.squeeze(1)
         return x
 
     def forward(self, s):
@@ -539,8 +565,11 @@ class BaseAutoencoder(nn.Module):
         return self.decoder(x)
 
     def estimate_rv(self,x):
-        # estimate z
-        return self.rv_estimator(x)
+        rv_estimates = self.rv_estimator(x) # v and Var[v]
+        rv = rv_estimates[:,[0]]
+        log_err_square = rv_estimates[:,[1]]
+        rv_err = torch.exp(log_err_square)**0.5 # predict err
+        return rv, rv_err
 
     def estimate_v_act(self,x):
         return self.activity_estimator(x)
@@ -577,13 +606,22 @@ class BaseAutoencoder(nn.Module):
 
         # to make it to order unity for comparing losses, divide out L (number of bins)
         # instead of D, so that spectra with more valid bins have larger impact
-        if w.dim()==1:w=w.unsqueeze(1)
+        #if w.dim()==1:w=w.unsqueeze(1)
         loss_ind = w * (x - spectrum_observed).pow(2)
+
+        #topk_indices = torch.topk(loss_ind,3, dim=2).indices
+        # Create a mask of the same shape as x
+        #mask = torch.ones_like(loss_ind, dtype=torch.bool)
+        # Set the top 3 indices in each row to False in the mask
+        #mask.scatter_(2, topk_indices, False)
+        # Use the mask to set the top 3 elements to zero
+        #loss_ind = loss_ind * mask
+
         loss_ind = torch.sum(loss_ind, dim=-1) / torch.sum(w>1,dim=-1)
         if individual:
             return loss_ind
-        D = loss_ind.shape[1]
-        return torch.sum(loss_ind) / D
+        #D = loss_ind.shape[1]
+        return torch.sum(loss_ind)# / D
 
     def _normalization(self, x, m, w=None):
         # apply constant factor c that minimizes (c*m - x)^2
@@ -612,6 +650,7 @@ class SpectrumAutoencoder(BaseAutoencoder):
                  spec_rest=None,
                  weight_rest=None,
                  rv_estimator=None,
+                 planet_params=None,
                  skymask=None,
                  n_latent=10,
                  n_telluric=5,
@@ -634,10 +673,10 @@ class SpectrumAutoencoder(BaseAutoencoder):
             act=act,
         )
 
-        telluric = TelluricModel(wave_rest,instrument,n_decoder=n_telluric)
-        fringe = FringeModel(instrument)
+        telluric = None#TelluricModel(wave_rest,instrument,n_decoder=n_telluric)
+        fringe = None#FringeModel(instrument)
 
-        activity_estimator = ActivityEstimator(n_latent)
+        activity_estimator = ActivityEstimator(n_latent,planet_params=planet_params)
 
         if rv_estimator==None:
             rv_estimator = RVEstimator(instrument.wave_obs.shape,sizes = [20,40])
@@ -645,7 +684,7 @@ class SpectrumAutoencoder(BaseAutoencoder):
         if skip_encoding:
             encoder = None
             decoder.mlp = None
-            rv_estimator = NullRVEstimator()
+            #rv_estimator = NullRVEstimator()
 
         super(SpectrumAutoencoder, self).__init__(
             encoder,
