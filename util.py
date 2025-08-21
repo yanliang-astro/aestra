@@ -117,18 +117,18 @@ def divide_sky_model(spec,w,spec_sky,fringe_spec,template):
     w_new[outlier] = 1e-12
     return spec_input,w_new
 
-def interpolate_to_input_grid(batch,instrument,template_data,aug=False,extra_rv=0.):
+def interpolate_to_input_grid(batch,instrument,template_input,aug=False,extra_rv=0.):
     _,spec_raw,w,ssbrv,jd = batch
-    #wave_raw,spec_raw,w_raw,ssbrv = batch[:4]
+
     n_batch,n_spec = spec_raw.shape
     device = spec_raw.device
-    template = template_data[1].repeat(n_batch,1)
+    template = template_input.repeat(n_batch,1)
     wave_obs = instrument.wave_obs[0]
     wave_raw = wave_obs.repeat(n_batch,1)
 
     # produce augmentation data -- inject rv offset
     if aug:
-        z_lim = 5e-8 # 15 m/s
+        z_lim = 1e-8 # 3 m/s
         z_offset = z_lim*(torch.rand(n_batch,1, device=device)-0.5)
     else: z_offset = torch.zeros(n_batch,1, device=device)
 
@@ -155,6 +155,7 @@ def interpolate_to_input_grid(batch,instrument,template_data,aug=False,extra_rv=
     bad |= torch.roll(bad, -1, dims=1)
     bad |= torch.roll(bad, +1, dims=1)
     bad |= out
+    bad |= weight<4e4
 
     if aug:
         sigma = weight**(-0.5)
@@ -162,10 +163,55 @@ def interpolate_to_input_grid(batch,instrument,template_data,aug=False,extra_rv=
                                         device=device)
         spectrum += spec_noise
 
-    spec_input = spectrum - template
+    spec_input = (spectrum - template).float()
     weight[bad] = 1e-12
     spec_input[bad] = 0.0
-    return spec_input.float(), weight.float(), z_offset
+    gaussian_kernel = gaussian_kernel_1d(sigma=1, device=spectrum.device)
+
+    # Apply 1D convolution
+    spec_input = F.conv1d(spec_input.unsqueeze(1), gaussian_kernel, padding=1).squeeze(1)  # Padding to keep the output size the same
+
+    return spec_input, weight.float(), z_offset
+
+
+def interpolate_to_input_grid_raw(batch,instrument,template_raw,extra_rv=0.,polyb=0.):
+    wave_raw,spec_raw,w_raw,ssbrv,jd = batch
+
+    n_batch,n_spec = spec_raw.shape
+    wave_obs = instrument.wave_obs
+    device = wave_obs.device
+    template = template_raw.repeat(n_batch,1)
+
+    z = (ssbrv+extra_rv)/instrument.c
+    wave = wave_raw + wave_raw * polyb + wave_raw * z
+    #out = torch.zeros_like(spectrum,dtype=bool)
+    #spectrum = torch.zeros((n_batch,n_order,n_spec),device=device)
+
+    spectrum = Interp1d()(wave, spec_raw, wave_obs).float()
+    weight = Interp1d()(wave, w_raw, wave_obs).float()
+
+    wmin = torch.min(wave, dim=1, keepdims=True)[0]
+    wmax = torch.max(wave, dim=1, keepdims=True)[0]
+
+    out_ = (wave_obs < wmin) | (wave_obs > wmax)
+    out = out_
+
+    ill = (template == 0) | (spectrum == 0) | (weight < 1.0)
+
+    # mask out +/- 1 pixel of bad input data (zero flux)
+    bad = (spectrum < (template * 0.6)) | ill
+
+    # after linear interpolation, bad flux values are at most half of template values
+    # cut at 0.6 for safety
+    bad |= torch.roll(bad, -1, dims=1)
+    bad |= torch.roll(bad, +1, dims=1)
+    bad |= out
+    bad |= out
+    #bad |= weight<4e4
+
+    weight[bad] = 1e-12
+    spectrum[bad] = 0.0
+    return spectrum, weight, ssbrv,jd
 
 def interpolate_to_input_grid_old(batch,instrument,template_data,skymask=None,aug=False,extra_rv=0.):
     wave_raw,spec_raw,w_raw,ssbrv = batch[:4]
@@ -255,14 +301,20 @@ def load_model(path, instrument, device):
     wave_rest = model_dict['decoder.wave_rest']
     spec_rest = model_dict['decoder.spec_rest']
 
-    n_pl,n_param=model_dict['activity_estimator.planet_params'].shape
-    n_latent = 3#len(model_dict['encoder.mlp.mlp.9.bias'])
+    n_pl,n_param=model_dict['doppler_model.planet_params'].shape
+    print("n_pl,n_param:",n_pl,n_param)
+
+    if 'encoder.mlp.mlp.9.bias' in model_dict:
+        n_latent = len(model_dict['encoder.mlp.mlp.9.bias'])
+        skip_encoding = False
+    else: n_latent=10; skip_encoding = True
 
     model = SpectrumAutoencoder(instrument,
                                 wave_rest=wave_rest,
                                 spec_rest=spec_rest,
                                 n_latent=n_latent,
-                                planet_params=np.zeros((n_pl,n_param)),
+                                planet_params=np.ones((n_pl,n_param)),
+                                skip_encoding=skip_encoding,
                                 normalize=False)
     model.load_state_dict(mdict["model"][0],strict=False)
     model.to(device)

@@ -3,7 +3,7 @@
 import torch,os,sys,pickle,re
 import numpy as np
 import matplotlib.pyplot as plt
-from util import load_batch,moving_mean,simulate_planet
+import pandas as pd
 
 from scipy.ndimage import gaussian_filter1d
 from sklearn.neighbors import KDTree
@@ -16,6 +16,7 @@ from scipy.optimize import curve_fit
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from util import load_batch,moving_mean,simulate_planet
 #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 device = torch.device('cpu')
 
@@ -54,15 +55,26 @@ class ActivityEstimator(nn.Module):
         self.mlp = MLP(n_in,n_out,n_hidden=n_hidden,act=act,dropout=dropout)
         # Initialize additional trainable parameters
         if initial_guess is not None:
+            K,P,ph = initial_guess
             self.planet_params = nn.Parameter(torch.tensor(initial_guess,device=device))
-        else: self.planet_params = torch.zeros((3),device=device)
+            self.P_init = P
+        else: 
+            self.planet_params = torch.zeros((3),device=device)
+            self.P_init = 0
 
     def forward(self, x):
         x = self.mlp(x)
         return x
 
+    def get_period(self):
+        #delta_P = self.planet_params[1]
+        #print(f"P{self.P_init:.3f} + {delta_P:.6f}")
+        return self.planet_params[1]
+    
     def doppler_rv(self,t):
-        _, v_doppler = simulate_planet(t,*self.planet_params)
+        K,_,ph = self.planet_params
+        P = self.get_period()
+        _, v_doppler = simulate_planet(t,*(K,P,ph))
         return v_doppler
 
 def get_colormap(cdata,cmap,vmin=0,vmax=1):
@@ -115,7 +127,7 @@ def planet_param_chi(param,time,v_obs,v_err,full=False):
         return v_planet,loss
     return loss
 
-def initial_guess(period,time,v_ccf):
+def initial_guess(period,time,v_ccf,v_err):
     phase_grid = np.arange(0,1,0.05)
     chi_best = np.inf
     for i,ph in enumerate(phase_grid):
@@ -124,7 +136,7 @@ def initial_guess(period,time,v_ccf):
         if chi<chi_best:
             best_guess = p_guess
             chi_best = chi
-    amp_grid = np.arange(0.1,2,0.1)
+    amp_grid = np.arange(0.1,1,0.05)
     chi_best = np.inf
     for i,a in enumerate(amp_grid):
         p_guess = [a] + best_guess[1:]
@@ -246,62 +258,99 @@ def tensor2array(tensor):
         return tensor.detach().cpu().numpy()
     else: return tensor.detach().numpy()
 
-def train_nn(time,v_ccf,input_features,planet_guess=None, n_epochs = 200):
-    features = np.copy(input_features)
-    print(f"feature shape: {features.shape}")
-    features -= np.mean(features,axis=0)
-    features /= np.std(features,axis=0)
-    features = torch.tensor(features,device=device).float()
-    time_tensor = torch.tensor(time[:, None],device=device)
 
-    input_tensors = (features,torch.tensor((v_ccf)[:, None],device=device), 
-                     time_tensor)
-    batch_size = min(len(v_ccf), 2000)
-    train_dataset = TensorDataset(*input_tensors)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
-
+def train_nn(input_data, planet_guess=None, n_epochs = 500, batch_size = 2000):
+    input_tensors = []
+    train_loaders = []
+    models = []
     if planet_guess is None:doppler=False
     else:doppler=True
 
-    v_activity_estimator = ActivityEstimator(features.shape[1], 1, planet_guess)
+    for data_i in input_data:
+        time,v_ccf,v_err,input_features = data_i
 
-    v_activity_estimator.to(device)
-    optimizer = torch.optim.Adam(v_activity_estimator.parameters(), lr=0.005)
-    v_activity_estimator.train()
+        features = np.copy(input_features)
+        print(f"feature shape: {features.shape}")
+        features -= np.mean(features,axis=0)
+        features /= np.std(features,axis=0)
+        features = torch.tensor(features,device=device).float()
+        time_tensor = torch.tensor(time[:, None],device=device)
+        v_ccf_tensor = torch.tensor((v_ccf)[:, None],device=device)
+        verr_tensor = torch.tensor((v_err)[:, None],device=device)
+        input_tensor = (features,v_ccf_tensor,verr_tensor,time_tensor)
 
-    sigma_v = 1
+        train_dataset = TensorDataset(*input_tensor)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+        model = ActivityEstimator(features.shape[1], 1, planet_guess)
+        model.to(device)
+
+        input_tensors.append(input_tensor)
+        train_loaders.append(train_loader)
+        models.append(model)
+
+    for j in range(len(models)):
+        if j==0:continue
+        models[j].planet_params = models[0].planet_params
+
+    all_params = []
+    for model in models: all_params.extend(model.mlp.parameters())
+    all_params.append(models[0].planet_params)
+    
+    optimizer = torch.optim.Adam(all_params, lr=0.002)
+    
+
     for epoch in range(n_epochs):
-        for batch in train_loader:
-            latent_i,v_app_i,times_i = batch
+        for j in range(len(input_data)):
+            model = models[j]
+            model.train()
             optimizer.zero_grad()
-            v_act = v_activity_estimator(latent_i)
+            loss = 0
+            for batch in train_loaders[j]:
+                latent_i,v_app_i,sigma_v_i,times_i = batch
+                
+                v_act = model(latent_i)
 
-            if doppler:v_doppler = v_activity_estimator.doppler_rv(times_i)
-            else: v_doppler = 0
-            #loss_smooth = compute_velocity_gradient(latent_i, v_act).sum()
-            loss = (v_app_i - v_act - v_doppler)**2 / sigma_v**2
-            loss = loss.sum()# + loss_smooth
+                if doppler:v_doppler = model.doppler_rv(times_i)
+                else: v_doppler = 0
+
+                loss_ = (v_app_i - v_act - v_doppler)**2 / sigma_v_i**2
+                # allow 1% outliers
+                #print("loss_:",loss_.shape,loss_)
+                #exit()
+                loss += loss_.sum()# + loss_smooth
+
+                break
             loss.backward()
             optimizer.step()
-            break
-        if epoch % 50 == 0:
-            print(f'Epoch {epoch + 1}/{n_epochs}, Resid RMS:{(v_app_i - v_act - v_doppler).std():.2f} m/s')
-        #if epoch % 500 == 0:
-        #    print("Saving model to %s..." % filepath)
-        #    torch.save(v_activity_estimator.state_dict(), filepath)
-    print("Training complete.")
-    v_activity_estimator.eval()
-    v_act_nn = v_activity_estimator(features)
-    if doppler:
-        v_doppler = v_activity_estimator.doppler_rv(time_tensor)
-        v_doppler = tensor2array(v_doppler[:, 0])
-    else: v_doppler = np.zeros_like(v_ccf)
-    v_act_nn = tensor2array(v_act_nn[:, 0])
-    rms = (v_ccf - v_act_nn - v_doppler).std()
-    print(f"Residual RMS:{rms:.3f}m/s")
-    planet_bestfit = tensor2array(v_activity_estimator.planet_params)
-    return v_act_nn,v_doppler,planet_bestfit,rms
+            if epoch % 50 == 0:
+                print(f'Instrument {j} Epoch {epoch + 1}/{n_epochs}, Resid RMS:{(v_app_i - v_act - v_doppler).std():.2f} m/s')
 
+            #if epoch % 500 == 0:
+            #    print("Saving model to %s..." % filepath)
+            #    torch.save(v_activity_estimator.state_dict(), filepath)
+    print("Training complete.")
+    v_activity = []
+    inst_rms = []
+
+    for j,model in enumerate(models):
+        model.eval()
+
+        features,v_ccf,_,time = input_tensors[j]
+        v_act_nn = model(features)
+        if doppler:
+            v_doppler = model.doppler_rv(time)
+            v_doppler = tensor2array(v_doppler)
+        else: v_doppler = np.zeros((len(time),1))
+        v_act_nn = tensor2array(v_act_nn)
+        rms = (tensor2array(v_ccf) - v_act_nn - v_doppler).std()
+        print(f"Instrument {j} Residual RMS:{rms:.3f}m/s")
+        period = model.get_period()
+        planet_bestfit = tensor2array(model.planet_params)
+        planet_bestfit[1] = period
+        v_activity.append(v_act_nn)
+        inst_rms.append(rms)
+    return v_activity,v_doppler,planet_bestfit,inst_rms
 
 def calculate_harmonics(P):
     harmonics = []
@@ -319,32 +368,38 @@ def calculate_harmonics(P):
     harmonics.sort()
     return harmonics
 
-def detect_ls_peaks(per,power,n_peaks = 15,frac=0.2,delta=2):
+def detect_ls_peaks(per,power,n_peaks = 30,frac=0.1,delta=0.1):
     rank = np.argsort(power)[::-1]
     top_n_periods = np.zeros((n_peaks))
+    top_n_power = np.zeros((n_peaks))
 
     i = 0
     for rk in rank:
         per_max = per[rk]
-        if per_max>360:continue
+        if per_max>390:continue
+        if per_max<1:continue
+        if np.abs(per_max - 1)<0.02:continue
+        if np.abs(per_max - 0.5)<0.02:continue
         nonzero = top_n_periods>0
         if nonzero.sum()>0:
             if (np.abs(top_n_periods[nonzero]-per_max)/per_max).min()<frac:continue
             if np.abs(top_n_periods[nonzero]-per_max).min()<delta:continue
-        top_n_periods[i] = per_max;i+=1
+        top_n_periods[i] = per_max
+        top_n_power[i] = power[rk]
+        i+=1
         #harmoniscs.extend(calculate_harmonics(per_max))
         if (top_n_periods>0).sum()>=n_peaks:
             print("break!")
             break
-    top_n_periods = top_n_periods[top_n_periods>0]
-    return top_n_periods
+    mask = top_n_periods>0
+    top_n_periods = top_n_periods[mask]
+    top_n_power = top_n_power[mask]
+    return top_n_periods, top_n_power
 
-def remove_close_periods(periods, threshold=0.05):
-    if not periods:
-        return []
-
-    # Sort the periods in ascending order
-    periods = sorted(periods)
+def remove_close_periods(periods,powers,threshold=0.05):
+    # Sort the power in ascending order
+    rank = np.argsort(powers)[::-1]
+    periods = periods[rank]
 
     # Initialize the filtered list with the first period
     filtered_periods = [periods[0]]
@@ -355,31 +410,6 @@ def remove_close_periods(periods, threshold=0.05):
             filtered_periods.append(p)
 
     return filtered_periods
-
-def prepare_ccf_information(summary_dict,CCF_file):
-    wave_obs = summary_dict['info']["wave_obs"][0]
-    template = summary_dict['info']["template"][0]
-    print("planet_period:",planet_period)
-    data = summary_dict['data']
-    time = data['ids']
-    for key in data:
-        if type(data[key]) == dict:print(key, len(data[key]))
-        else:print(key, data[key].shape)
-
-    if data['spec_input'].ndim==3:
-        spectra = data['spec_input'][:,0,:]+template
-    else:spectra = data['spec_input']+template
-    ccf_matrix, velocity_grid = compute_ccf(spectra, wave_obs)
-    params,v_ccf,bisspan = compute_bisspan(velocity_grid,ccf_matrix)
-
-    ccf_dict = {"velocity_grid":velocity_grid,
-                   "time":time,"v_ccf":v_ccf,
-                   "ccf_matrix":ccf_matrix,
-                   "params":params,"bisspan":bisspan}
-    with open(CCF_file,"wb") as f:
-        pickle.dump(ccf_dict,f)
-    print(f"Saving to {CCF_file}...")
-    return
 
 def check_alignment_harmonics(f_aestra,P_activity,periods,tol=0.03):
     harmonics = []
@@ -417,270 +447,232 @@ def check_alignment_harmonics(f_aestra,P_activity,periods,tol=0.03):
             print(f"tol:{tol} {periods[wh]:.2f}d {comment}")
     return comments,good_periods
 
+def get_timeseries(neid_dict,colname,keys):
+    vector = np.array([neid_dict[key][colname] for key in keys])
+    print(colname,vector.shape)
+    return vector
+
+def weighted_average_time_series(df):
+    # Compute weights = 1 / (sigma^2)
+    df['weight'] = 1.0 / (df['velocity_error'] ** 2)
+
+    # Group by time and compute weighted average and its error
+    grouped = df.groupby('time').apply(
+        lambda g: pd.Series({
+            'velocity': np.average(g['velocity'], weights=g['weight']),
+            'velocity_error': np.sqrt(1.0 / g['weight'].sum())
+        })
+    ).reset_index()
+    return grouped
+
 basename = sys.argv[1]
 outdir = "initial_guess"
-output_txt = f"{outdir}/{basename}_ccf.txt"
-CCF_file = f"{outdir}/CCF/CCF_{basename}.pkl"
-fallback_CCF_file = f"{outdir}/CCF/CCF_modelfree.pkl"
+#output_txt = f"{outdir}/{basename}_ccf.txt"
+output_txt = f"{outdir}/{basename}_test.txt"
 
 
-per = np.logspace(0.2, 2.6, 10000)
+per = np.logspace(-1.2, 2.6, 5000)
 frequency = 1.0/per
 colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
-stellar_pattern = r'period(\d+\.\d+)d_K(\d+\.\d+)m_phase(\d+\.\d+)_(\d+)_(\w+)'
-debug_pattern = r'\w+_(\d+)_(\w+)\.pt'
+planet_pattern = r'period(\d+\.\d+)d_K(\d+\.\d+)m_phase(\d+\.\d+)'
 
-if re.search(stellar_pattern, basename): 
+tag = "prod"
+
+if re.search(planet_pattern, basename): 
     # Search for the pattern in the file path
-    match = re.search(stellar_pattern, basename)
+    match = re.search(planet_pattern, basename)
     # Extract the numbers as a list of integers
     planet_period = float(match.group(1))
     planet_amp = float(match.group(2)) # m/s
     t0 = float(match.group(3))
-    order_value = int(match.group(4))
-    suffix = match.group(5)
+    #suffix = match.group(5)
 
 else:
     print("Pattern not found")
-    match = re.search(debug_pattern, basename)
     # Extract the numbers as a list of integers
     planet_period = 80.1
     planet_amp = 0.0
     t0 = 0.0
-    order_value = int(match.group(1))
-    suffix = match.group(2)
+
 
 truth = [planet_amp,planet_period,t0]
 print("planet:",truth)
 
-if os.path.isfile(sys.argv[1]):
-    with open(sys.argv[1],"rb") as f:
-        summary_dict=pickle.load(f)
-    planet_period,planet_amp,t0 = summary_dict['info']['planet_params']
-    basename = os.path.basename(sys.argv[1])
-    basename = "_".join(basename.split("_")[:-2])
-    output_txt = f"{outdir}/{basename}_ccf.txt"
-    update_txt = f"{outdir}/{basename}_finetune.txt"
-    v_planet = summary_dict['data']['v_planet'][:,0]
+sum_file = f"summary_file/{basename}_purez_sum.pkl"
+with open(sum_file,"rb") as f:
+    info_dict = pickle.load(f)
+    print("info_dict:",info_dict['data'].keys())
 
-    imgname = f"{outdir}/harmonics_{basename}.png"
-    time =  summary_dict['data']["ids"][:,0]
-    star_latent = summary_dict["data"]["s"]
-    v_encode =  summary_dict['data']['v_encode'][:,0]
-    v_err =  summary_dict['data']['v_encode_err'][:,0]
-    v_activity = summary_dict['data']['v_act'][:,0]
-    
-    planets = summary_dict['info']['planet_solution']
-    non_zero = (planets[:,1]>per.min())&(planets[:,1]<per.max())
-    planets = planets[non_zero]
+ids = info_dict['data']['ids'][:,0]
+v_encode = info_dict['data']['v_encode'][:,0]
+v_err = info_dict['data']['rv_err'][:,0]
+print("v_encode:",v_encode.shape)
 
-    v_doppler_ind = summary_dict['data']['v_doppler'][:,non_zero]
+datadir = "/scratch/gpfs/yanliang/neid-production"
+#dataset_tag = "prep_order50_before"
+param_names = ["K [m/s]  ","Period [d]",  "Phase    ", "Sigma    "]
 
-    reject_tols = [0.03,0.01]
-    v_doppler_sum = v_doppler_ind.sum(axis=-1)
- 
-    v_aestra = v_encode-v_activity
-    v_aestra -= v_aestra.mean()
-    power_aestra = LombScargle(time, v_aestra, v_err).power(frequency)
-    noise_level = np.quantile(power_aestra,0.9)
-    print("10% level:",noise_level)
+power_orders = []
+all_periods = []
+all_periods_power = []
+all_times = []
+all_v = []
+all_verr = []
+all_data = []
 
-    periods = planets[:,1]
-    f_aestra = interp1d(per,power_aestra)
-    print("periods,",periods,per)
-    promising = f_aestra(periods)>noise_level
+dataset_tag = f"{tag}_full"
+print("dataset_tag:",dataset_tag)
 
-    print("planets:",planets[:4,1],f_aestra(planets[:4,1]))
-    
-    s_corr = np.corrcoef(v_activity,star_latent.T)[0][1:]
-    max_corr = np.argmax(np.abs(s_corr))
-    print("s_corr:",s_corr, max_corr)
+files = ["%s/ccf_info/%s"%(datadir,ii) for ii in os.listdir(f"{datadir}/ccf_info") if ii.startswith(dataset_tag) and bool(re.search(r'_\d+.pkl$', ii))]
 
-    power_act_label = f"$s_{max_corr+1}$"#"$v_{act}$"
-    power_act = LombScargle(time, star_latent[:,max_corr]).power(frequency)
-    P_activity = detect_ls_peaks(per,power_act,n_peaks=3,frac=0.05,delta=0.5)
+ccf_info = []
+time = []
+for file in files:
+    batch = load_batch(file)
+    ccf_info.append(batch[0])
+    time.append(batch[4])
+print("ccf_info:",len(ccf_info))
+ccf_info = torch.cat(ccf_info,dim=0)
+time = torch.cat(time,dim=0)
 
-    for r in range(len(planets)):
-        if planets[r][1]<=0:continue
-        corr = np.corrcoef(v_doppler_ind[:,r].T,star_latent.T)[0][1:]
-        print(f"Period {planets[r][1]:.3f}d corrcoef with s: {corr}")
 
-    #P_activity = remove_close_periods(P_activity)
-    print("P_activity:",P_activity)
+time = tensor2array(time[:,0])
+v_trad = np.copy(tensor2array(ccf_info[:,0]))
 
-    promising = f_aestra(periods)>noise_level
-    
-    i = 0
-    comments,good = check_alignment_harmonics(f_aestra,P_activity,periods,tol=reject_tols[i])
-    while (promising&good).sum()==0:
-        i+=1
-        print("All promising candiates excluded!!")
-        comments,good = check_alignment_harmonics(f_aestra,P_activity,periods,tol=reject_tols[i])
 
-    print("promising&good candidates",planets[promising&good])
-    keep = np.where(promising&good)[0]
-    print("keep:",keep,planets[keep])
-    new_planets = np.zeros((len(keep),3))
-    for i,index in enumerate(keep):
-        p0 = planets[index]
-        print("p0",p0)
-        # Fit the sinusoidal model
-        result = minimize(planet_param_chi,p0, args=(time, v_aestra,v_err,),method='Nelder-Mead')
-        bestfit_params = result.x
-        bestK,bestP,bestph = bestfit_params
-        print(f"Recovered: {bestP:.3f}d  {bestK:.2f} m/s")
-        if np.abs(bestP - new_planets[:,1]).min()/bestP<0.05:
-            print("Duplicate periods!");continue
-        new_planets[i] = bestfit_params
-    new_planets = new_planets[new_planets[:,0]>0]
-    print("Updated planet solution!",update_txt)
-    np.savetxt(update_txt,new_planets)
-    
-    fig,ax=plt.subplots(figsize=(8,5),constrained_layout=True)
+#v_trad = np.copy(v_ccf)
 
-    scale = power_aestra.max()/power_act.max()
-    ax.semilogx(per,scale*power_act,'-',c="darkgrey", label=power_act_label)
+# remove outliers
+tgrid = np.linspace(time.min(),time.max(),50)
+good = (time<800)|(time>920)
+print("good:",good.sum())
+#'''
+for i in range(len(tgrid)-1):
+    mask = (time>tgrid[i])&(time<=tgrid[i+1])
+    if mask.sum()<10:continue
+    v_ref, v_std = np.median(v_trad[mask]),v_trad[mask].std()
+    outlier = np.abs(v_trad-v_ref)>3*v_std
+    good[mask&outlier] = False
 
-    #for i in range(star_latent.shape[1]):
-    #    power_s = LombScargle(time, star_latent[:,i]).power(frequency)
-    #    scale = power_aestra.max()/power_s.max()
-    #    ax.semilogx(per,scale*power_s,'-',alpha=1.0, label=f"$s_{i+1}$")
+print("bad:",(~good).sum())
+print(f"v_trad: {v_trad.std():.2f} m/s v_trad[good]: { v_trad[good].std():.2f} m/s")
 
-    ax.semilogx(per,power_aestra,'k-',alpha=1.0, label="$v_{aestra,init}$")
-    ax.axhspan(0,noise_level,color="lightgrey",lw=0,
-               zorder=-20,label="noise")
-    for p in periods[keep]:ax.axvline(p,color="darkgrey",lw=1,zorder=-10)
+'''
+ph,v_planet = simulate_planet_np(time,*truth)
+#basename="period3.162d_K0.1m_phase0.0"
+aux_data = np.vstack((ids,v_encode,good)).T
+print("aux_data:",aux_data.shape)
+sort_ind = np.argsort(aux_data[:,0])
+aux_data = aux_data[sort_ind]
+aux_data = torch.from_numpy(aux_data.astype(np.float32)).T
+print("aux_data:",aux_data.shape)
+filepath = f"{datadir}/aux/{basename}_v_encode.pkl"
+torch.save(aux_data,filepath)
+exit()
+'''
+#v_encode_tensor = torch.from_numpy(v_encode.astype(np.float32))
 
-    for i,p in enumerate(comments.keys()):
-        ax.axvline(p,c=colors[i],ls="--",label=f"{p:.2f}d")
-        ax.text(1.05*p,power_aestra.max(),
-                comments[p],verticalalignment='top',
-                color=colors[i],rotation=90)
-    ax.axvline(planet_period,lw=8,color="gold",alpha=0.5,zorder=-20,label="Truth")
-    title = f"Truth: K={planet_amp:.2f} m/s P={planet_period:.3f}d  phase={t0:.2f}"
-    ax.set_title(title)
-    ax.set_xlabel("Period [days]");ax.set_ylabel("Power")
-    ax.legend()
-    plt.savefig(imgname,dpi=200)
-    plt.clf()
-    '''
-    with open(output_txt,"r") as f:
-        content = f.readlines()
-    ampls = np.array([float(line.split()[0]) for line in content])
-    periods = np.array([float(line.split()[1]) for line in content])
-    
-    promising = f_aestra(periods)>noise_level # 1% peaks
-    good = periods<0
-    i = 0
-    comments,good = check_alignment_harmonics(harmonics,planets[:,1],tol=reject_tols[i])
-    while (promising&good).sum()==0:
-        i+=1
-        print("All promising candiates excluded!!")
-        reject_tol = reject_tols[i]
-        comments,good = check_alignment_harmonics(harmonics,planets[:,1],tol=reject_tols[i])
-    print("promising&good candidates",(promising&good).sum())
+#'''
 
-    with open(update_txt,"w") as f:
-        for i,line in enumerate(content):
-            if i>=len(good):break
-            if good[i]:newline = line
-            else: newline ="#"+line.strip()+"\n"
-            f.writelines(newline)
-    '''
-    exit()
+time = time[good]
+v_trad = v_trad[good]
+v_encode = v_encode[good]
+v_err = v_err[good]
+v_template,v_ccf,depth,bisspan,sigma,c = tensor2array(ccf_info[good]).T
 
-# calculate_ccf_file
-print(CCF_file)
-if not os.path.isfile(CCF_file):
-    if not os.path.isfile(fallback_CCF_file):
-        filename = "/scratch/gpfs/yanliang/neid-dynamic/runtime/modelfree_50_after_sum.pkl"
-        with open(filename,"rb") as f:
-            summary_dict=pickle.load(f)
-        prepare_ccf_information(summary_dict,fallback_CCF_file)
-    print("Fallback CCF file: ",fallback_CCF_file)
-    CCF_file = fallback_CCF_file
-    fallback = True
-else: fallback = False
-
-print(f"loading from {CCF_file}...")
-with open(CCF_file,"rb") as f: ccf_dict = pickle.load(f)
-time =  ccf_dict['time'][:,0]
-v_ccf = ccf_dict['v_ccf']
-v_err = np.ones_like(v_ccf)
-params = ccf_dict['params']
-bisspan = ccf_dict['bisspan']
+print(f"v_ccf RMS={(v_ccf).std():.2f}m/s")
+print(f"v_template RMS={(v_template).std():.2f}m/s")
+print(f"Resid RMS={(v_ccf - v_template).std():.2f}m/s")
 
 ph,v_planet = simulate_planet_np(time,*truth)
 # add true planet signal to v_ccf
-if fallback: v_ccf += v_planet
+v_trad += v_planet
 
-for key in ccf_dict: print(key,ccf_dict[key].shape)
+# remove offset
+select = [time<800,time>800]
+offset = []
+for sel in select:
+    print("v_offset:",np.median(v_encode[sel]))
+    v_trad[sel] -= np.median(v_trad[sel])
+    v_encode[sel] -= np.median(v_encode[sel])
 
-depth,_,sigma,c = params.T
-#s1,s2,s3 =  summary_dict['data']['s'].T
+
+print(f"v_trad RMS={(v_trad).std():.2f}m/s")
+print(f"v_encode RMS={(v_encode).std():.2f}m/s")
+print(f"Difference RMS={(v_encode-v_trad).std():.2f}m/s")
+
+print(f"min:{v_trad.min():.2f} m/s, max:{v_trad.max():.2f} m/s")
 input_features = np.vstack((depth,bisspan,sigma,c)).T
-lowest_rms = np.inf
+#input_data = [[time,v_trad,v_err,input_features]]
 
-for i in range(3):
-    v_act,_,_,rms=train_nn(time,v_ccf,input_features)
-    if rms<lowest_rms:
-        lowest_rms = rms
-        v_activity = v_act
+input_data = []
 
-param_names = ["K [m/s]  ","Period [d]",  "Phase    ", "Sigma    "]
+#v_input = v_trad
+v_input = v_encode
 
-v_detrend = v_ccf-v_activity
+#v_err = np.ones_like(v_input)*v_input.std()
+full_data = [time,v_input,v_err,input_features]
+
+for mask in select:input_data.append([item[mask] for item in full_data])
+
+v_activity,_,_,rms=train_nn(input_data)
+v_detrend = np.zeros_like(v_input)
+
+for i,mask in enumerate(select):
+    v_detrend[mask] = v_input[mask] - v_activity[i][:,0]
 
 print(f"v_detrend RMS={(v_detrend).std():.2f}m/s")
-
 power = LombScargle(time, v_detrend).power(frequency)
-print(v_detrend.shape,"time",time.shape)
+top_n_periods,top_n_power = detect_ls_peaks(per,power)
 
-per = 1/frequency
-
-top_n_periods = detect_ls_peaks(per,power)
-
-top_n_params = np.zeros((len(top_n_periods),3))
-top_n_Ks = np.zeros_like(top_n_periods)
-top_n_chi = np.zeros_like(top_n_periods)
-top_n_v_act = np.zeros((len(top_n_periods),len(time)))
-top_n_v_doppler = np.zeros((len(top_n_periods),len(time)))
+print("time:",time.shape) 
+print("v_detrend:",v_detrend.shape)
+# Example usage
 
 print("top_n_periods:",top_n_periods)
-
+#top_n_periods[0] = 3.162
 #------------------ plotting ------------------
 fig,ax=plt.subplots(figsize=(8,4),constrained_layout=True)
-power_i = LombScargle(time, v_detrend).power(frequency)
-ax.semilogx(per,power_i,'k-',alpha=1.0,lw=2,label="$v_{detrend}$")
+ax.semilogx(per,power,'-',alpha=1.0,lw=1.5,label=f"Power")
+#ax.semilogx(per,power_avg,'k-',alpha=1.0,lw=1,label=f"Combined")
+#ax.semilogx(period_grid,guess_params[:,0],'-',alpha=1.0,label=f"Guess")
 ax.axvline(planet_period,lw=8,color="gold",alpha=0.5,zorder=-20,label="Truth")
 ax.set_xlabel("Period [days]");ax.set_ylabel("Power")
-for period in top_n_periods: ax.axvline(period,lw=2,color="r",ls="--")
+for period in top_n_periods: ax.axvline(period,lw=1,color="lightgrey",ls="-",zorder=-10)
 ax.legend()
 plt.savefig(f"{outdir}/guess_{basename}.png",dpi=200)
 plt.clf()
+ 
+top_n_params = np.zeros((len(top_n_periods),3))
+top_n_Ks = np.zeros_like(top_n_periods)
+top_n_chi = np.zeros_like(top_n_periods)
+top_n_v_doppler = np.zeros((len(top_n_periods),len(time)))
 
-v_exist = np.zeros_like(v_detrend)
 for i,try_period in enumerate(top_n_periods):
-    best_guess,chi_guess = initial_guess(try_period,time,v_detrend)
+    best_guess,chi_guess = initial_guess(try_period,time,v_detrend,v_err)
     top_n_params[i] = best_guess
     print("Period:",try_period,"best_guess:",best_guess)
 
-    v_act_nn,v_doppler,pfit,rms = train_nn(time,v_ccf,input_features,best_guess)
+    v_act_nn,v_doppler,pfit,rms = train_nn(input_data,best_guess)
+    v_doppler = v_doppler[:,0]
+    
     pfit[0] = np.abs(pfit[0])
-    chi = np.mean((v_ccf-v_act_nn-v_doppler)**2)
+    chi = np.mean(rms)
     print(f"Period:{pfit[1]:.3f}d chi: {chi:.4f}")
     top_n_Ks[i] = pfit[0]
     top_n_params[i] = pfit
     top_n_chi[i] = chi
-    top_n_v_act[i] = v_act_nn
-    top_n_v_doppler[i] = v_doppler
+    #top_n_v_act[i] = v_act_nn
+    #top_n_v_doppler[i] = v_doppler
     print_params(pfit,param_names)
-    v_exist += v_doppler
 
+planet_rank = np.argsort(top_n_Ks)[::-1]
+top_n_params = top_n_params[planet_rank]
 np.savetxt(output_txt,top_n_params)
 print("top_n_params:",top_n_params)
 
+exit()
 doppler_sum = top_n_v_doppler.sum(axis=0)
 colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
 sort_t = np.linspace(time.min(),time.max(),1000)#np.argsort(time)

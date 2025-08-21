@@ -40,10 +40,11 @@ class Synthetic(Instrument):
         batches = [item for item in batch_files if not "template" in item]
 
         NBATCH = len(batches)
+
         train_batches = batches#[:int(0.9*NBATCH)]
         valid_batches = test_batches= batches[int(0.9*NBATCH):]
         #valid_batches = test_batches = batches
-
+        print("train_batches:",train_batches[:3],len(train_batches))
         if which == "test": return test_batches
         elif which == "valid": return valid_batches
         elif which == "train": return train_batches

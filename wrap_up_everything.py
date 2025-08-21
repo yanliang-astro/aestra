@@ -9,6 +9,7 @@ import pickle
 import argparse
 import multiprocessing as mp
 import torch
+import torch.nn.functional as F
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -18,14 +19,16 @@ from matplotlib.cm import get_cmap
 from astropy.io import fits
 from scipy.interpolate import interp1d
 from synthetic_data import Synthetic
+from spender_model import TelluricModel
 #from torchinterp1d import Interp1d
 
-from util import moving_median,load_batch,merge_batch,load_master_fsr_mask
+from util import moving_median,load_batch,merge_batch,load_master_fsr_mask,interpolate_to_input_grid_raw
 from scipy.optimize import curve_fit,minimize
 
-dynamic_dir = "/scratch/gpfs/yanliang/neid-dynamic"
-datadir = "/scratch/gpfs/yanliang/NEID-SOLAR"
-runtime_dir = "/scratch/gpfs/yanliang/neid-dynamic/params/"
+dynamic_dir = "/scratch/gpfs/yanliang/neid-production"
+#datadir = "/scratch/gpfs/yanliang/NEID-SOLAR"
+datadir = "/scratch/gpfs/yanliang/NEID-DRP1p4"
+runtime_dir = f"{dynamic_dir}/params/"
 device =  torch.device("cpu")
 
 blacklist = [37, 43, 44, 51, 52, 55, 60, 65, 66, 69, 70, 71, 75, 76, 78, 79, 80, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99]
@@ -38,6 +41,14 @@ def gaussian(x, amplitude, mean, stddev):
     if stddev<0.01:return np.ones_like(x)
     if amplitude>1:amplitude=1
     return np.abs(amplitude) * np.exp(-((x - mean) ** 2) / (2 * stddev ** 2))
+
+# Define a Gaussian function
+def gaussian_ccf_chi(params,x, y_obs,full=False,y_err=1e-3):
+    a, mu, sigma, c = params
+    y_gauss = a * np.exp(-0.5 * ((x - mu) / sigma) ** 2) + c
+    chi = (y_obs-y_gauss)**2/y_err**2
+    if full:return y_gauss
+    return chi.mean()
 
 # Function to fit multiple Gaussians
 def multi_gaussian(x, *params):
@@ -77,21 +88,31 @@ def read_ccf_rv(header):
     ccf_rv = np.array(ccf_rv)
     return ccf_rv
 
-def read_fits(filename,order_value,quality_mask,read_keys=['OBSJD','DATE-OBS','AIRMASS']):
+def read_fits(filename,order_value,quality_mask,read_keys=['OBSJD','DATE-OBS','AIRMASS','E_VER']):
     hdulist = fits.open(filename)
     header = hdulist[0].header
     ccf_header = hdulist[12].header
     telluric_header = hdulist[10].header
-    
+
     science_wavelength = hdulist[7].data[order_value][quality_mask]
     science_flux = hdulist[1].data[order_value][quality_mask]
     science_variance = hdulist[4].data[order_value][quality_mask]
     science_blaze = hdulist[15].data[order_value][quality_mask]
+    telluric_flux = hdulist[10].data[order_value][quality_mask]
+
+    if not header['E_VER']=='v1.3.0':
+        print("\n\nversion:",header['E_VER'],filename)
+        print('\n telluric_flux:',telluric_flux.shape)
+        #print('telluric_header',telluric_header)
+        #exit()
+    # just the lines, no continuum
+    #telluric_model = telluric_flux[:,0]#*telluric_flux[:,1]
+    telluric_model = np.ones_like(science_flux)
     # Close the FITS file
     hdulist.close()
     
     science = [science_wavelength,science_flux,science_variance]
-    data = [science,science_blaze]
+    data = [science,science_blaze,telluric_model]
 
     SSBRV= get_barycentric_corr_rv(header)
     CCFRV = read_ccf_rv(ccf_header)
@@ -105,15 +126,96 @@ def read_fits(filename,order_value,quality_mask,read_keys=['OBSJD','DATE-OBS','A
     info_dict["DVRMSMOD"] = ccf_header["DVRMSMOD"]*km_m
     # time zero point
     info_dict["timestamp"] = np.float32(info_dict["OBSJD"] - 2459000.0)
+
     return data,info_dict
 
+def load_model(mainfile, instrument):
+    device = instrument.wave_obs.device
+    mdict = torch.load(mainfile, map_location=device)
+    wave_rest =  mdict['model'][0]['wave_rest']
+    spec_rest =  mdict['model'][0]['spec_rest']
+    bias = mdict['model'][0]['encoder.mlp.mlp.9.bias']
+
+    model = TelluricModel(wave_rest,spec_rest,instrument)
+    model.load_state_dict(mdict['model'][0], strict=False)
+    model.to(device)
+    losses = mdict['losses']
+    return model, losses
+
+def evaluate_sky_model(model,batch,template=None,skymask=None):
+    instrument = model.instrument
+    telluric_offset = model.evaluate_telluric_rv_offset(batch[4])
+    print(f"\n Additional Telluric Offset:{telluric_offset.min().item():.3f} m/s, {telluric_offset.max().item():.3f} m/s")
+    polyb = model.evaluate_wavelength_polynomial(batch[0],batch[4])
+    print(f"\nWavelength shift:{polyb.std(dim=1).max()*instrument.c:.3f} m/s \n")
+
+    wave_obs = instrument.wave_obs
+
+    # shift to the stellar restframe - frame of wave_obs
+    spectrum, w, ssbrv,jd = interpolate_to_input_grid_raw(batch,instrument,template,polyb=polyb)
+    spec_input = spectrum - template
+    spec_input[w<1] = 0
+
+    wave_raw,spec_raw,w_raw,ssbrv,jd = batch
+    z_sky = (ssbrv+telluric_offset)/instrument.c
+    s_sky = model.encode(spec_input)
+
+    lines,continuum,y_act,spec_model =  model._forward(s_sky,z_sky,wave_obs,skymask=skymask)
+
+    telluric_spec = (1 - lines) * (1 + continuum)
+    telluric_spec = model.transform(telluric_spec, z_sky, wave_obs)  
+
+    aux = s_sky[:, -1:]
+    clean_spec = (spectrum - 1e-3 * aux)/telluric_spec
+
+    spec_avg = torch.median(clean_spec,dim=0)[0]
+    spec_resid = clean_spec - spec_avg
+
+    spec_resid[w<1] = 0
+    w_std = moving_std_weight_batch_torch(spec_resid,w>1)
+    w_new = 1/(1/w_std+1/w)
+
+    new_batch = [clean_spec, w_new, ssbrv,jd]
+    new_batch = [tensor2array(item) for item in new_batch]
+
+    '''
+    new_batch = [tensor2array(item) for item in new_batch]
+    wave_raw,spec_raw,w_raw = [tensor2array(item) for item in batch[:3]]
+    clean_spec, w_new, ssbrv,jd = new_batch
+    wave_obs = tensor2array(wave_obs[0])
+    template = tensor2array(template[0])
+    spec_input = tensor2array(spec_input)
+    fig,axs = plt.subplots(figsize=(10,4),nrows=2,constrained_layout=True)
+    axs[0].plot(wave_obs,template,'k-',lw=1,alpha=1)
+    for i in range(clean_spec.shape[0]):
+        count_bad = (w_new[i]<1).sum()
+
+        print("count_bad:",count_bad)
+        print("spec input w:",(w[i]<1).sum())
+        print("w_raw:",(w_raw[i]<1).sum())
+        #axs[0].plot(spec_input[i],'k-',lw=1,alpha=1)
+        axs[0].plot(wave_raw[i],spec_raw[i],'-',lw=1,alpha=1)
+        axs[1].plot(wave_obs,clean_spec[i],'-',lw=1,alpha=1)
+        #break
+    #axs[1].plot(wave_obs,clean_spec[where],'r-',lw=1,alpha=1)
+    #for ax in axs:ax.set_ylim(-0.02,0.02);
+    for ax in axs: ax.set_xlim(5035,5040)
+    plt.savefig("test.png",dpi=200)
+    exit()
+    '''
+    return new_batch
+
+
 def redshift_chi(rv,wave_model,yrest,weight_rest,wave_data,ydata,wdata):
-    wave_shifted = wave_model*(1 + rv/Synthetic.c)
+    wave_shifted = wave_model*(1.0 + rv/Synthetic.c)
     bad = yrest==0
 
     mask = (wave_data>min(wave_shifted[~bad]))&(wave_data<max(wave_shifted[~bad]))
-    model_obs = interp1d(wave_shifted[~bad], yrest[~bad])(wave_data[mask])
+    mask[:10] = False
+    mask[-10:] = False
+    model_obs = interp1d(wave_shifted[~bad], yrest[~bad], kind='cubic')(wave_data[mask])
     loss = np.sum(wdata[mask]* (ydata[mask] - model_obs)**2) / len(ydata[mask])
+    #print("rv:",rv,"loss:",loss,"mask:",mask.sum())
     return loss
 
 def find_deepest_lines(wave_obs, raw_spectrum, num_lines=30, min_separation=0.10,return_ind=False):
@@ -152,8 +254,10 @@ def mask_deepest_lines(wave_obs, lines_to_mask, mask_width=0.15):
         skymask[mask_indices] = True
     return skymask
 
-def prepare_spectrum_single_order(obsname,quality_mask,order_value):
+def prepare_spectrum_single_order(obsname,quality_mask,order_value,telluric=False):
     large_number = 1e6
+    #data,info_dict = read_fits("%s/%s"%(datadir,obsname),order_value=order_value,quality_mask=quality_mask)
+    
     try:
         data,info_dict = read_fits("%s/%s"%(datadir,obsname),order_value=order_value,quality_mask=quality_mask)
     except:
@@ -164,7 +268,7 @@ def prepare_spectrum_single_order(obsname,quality_mask,order_value):
     spectrum = np.zeros((n_spec))
     spectrum_err = np.zeros((n_spec))
 
-    science,blaze = data
+    science,blaze,telluric_model = data
     wave_raw,flux,flux_var = science
 
     ssbrv = info_dict["SSBRV"]
@@ -174,10 +278,16 @@ def prepare_spectrum_single_order(obsname,quality_mask,order_value):
 
     normflux = np.zeros_like(flux)
     normflux_err = np.zeros_like(flux_var)
+    
 
-    norm = np.quantile(flux[~isnan]/blaze[~isnan],0.5)
-    normflux[~isnan] = flux[~isnan]/(norm*blaze[~isnan])
-    normflux_err[~isnan] = flux_var[~isnan]**0.5/(norm*blaze[~isnan])
+    normflux[~isnan] = flux[~isnan]/(telluric_model[~isnan]*blaze[~isnan])
+    norm = np.quantile(normflux[~isnan],0.5)
+    normflux[~isnan] /= norm
+    normflux_err[~isnan] = flux_var[~isnan]**0.5/(norm*telluric_model[~isnan]*blaze[~isnan])
+
+    #norm = np.quantile(flux[~isnan]/blaze[~isnan],0.5)
+    #normflux[~isnan] = flux[~isnan]/(norm*blaze[~isnan])
+    #normflux_err[~isnan] = flux_var[~isnan]**0.5/(norm*blaze[~isnan])
     if normflux.min()<0:
         print("negative flux!",normflux.min(),normflux.max())
     elif blaze.min()<=0.:
@@ -191,6 +301,7 @@ def prepare_spectrum_single_order(obsname,quality_mask,order_value):
 
     badmask = detect_bad_pixel([wavelength,spectrum,spectrum_err])
     spectrum_err[badmask] = large_number
+    if telluric:info_dict['telluric_model'] = telluric_model
     return [wavelength,spectrum,spectrum_err],info_dict
 
 def save_batch(batch,filename):
@@ -279,8 +390,17 @@ def photon_noise(spec_rest,wave_rest,sn):
     return RV_rms
 
 def fit_rv(wave,spec,w,wave_rest,rest_model,weight_model):
-    result = scipy.optimize.minimize(redshift_chi,0.0, method='Nelder-Mead',args=(wave_rest,rest_model,weight_model,wave,spec,w,))
+    result = scipy.optimize.minimize(redshift_chi,0.05, method='Nelder-Mead',args=(wave_rest,rest_model,weight_model,wave,spec,w,),tol=1e-8)
     label = "RV_fit=%.2f $\chi^2$:%.2f"%(result.x,result.fun)
+
+    # not converged... try again
+    if np.abs(result.x)<1e-4:
+        chi_previous = result.fun
+        result = scipy.optimize.minimize(redshift_chi,-0.05, method='Nelder-Mead',args=(wave_rest,rest_model,weight_model,wave,spec,w,),tol=1e-8)
+        label = "RV_fit=%.2f $\chi^2$:%.2f"%(result.x,result.fun)
+        if not result.fun<chi_previous:
+            print("Strange behavior..",label)
+            label += "Failed"
     return result.x, result.fun, label
 
 def get_timeseries(neid_dict,colname,keys):
@@ -350,7 +470,6 @@ def wrap_data(sample_names,datatag,batch_size,order_value,quality_mask):
         [p.start() for p in running_list]
         [p.join()  for p in running_list]
 
-
     neid_dict = {k:v for k,v in mdict.items()}
     # remove poor-quality spectra
     sample_names = [i for i in sample_names if i in neid_dict]
@@ -398,16 +517,21 @@ def interpolate_to_input_grid(batch,instrument,template_raw):
     spectrum[bad] = 0.0
     return spectrum, weight, ssbrv,jd
 
-def calculate_template_spectrum(datatag,wave_obs):
+def calculate_template_spectrum(datatag,wave_obs,subdir=""):
     print(f'Loading from {runtime_dir}/{datatag}-param.pkl')
     with open(f'{runtime_dir}/{datatag}-param.pkl',"rb") as f:
         neid_dict = pickle.load(f)
 
-    # calculate v_template and chi_template
-    file_batches = neid_dict["info"]["files"]
     order_value = neid_dict["info"]["order"]
-    batch = merge_batch(file_batches)
     
+    file_batches = []
+    for k,batch_name in enumerate(neid_dict["info"]["files"]):
+        basename = os.path.basename(batch_name).rsplit('.', 1)[0]
+        fname = f"{dynamic_dir}/{subdir}{basename}.pkl"
+        if os.path.isfile(fname):
+            file_batches.append(fname)
+
+    batch = merge_batch(file_batches)
     waves,specs,weights,ssbrvs,ids = [item.numpy() for item in batch]
     print("file_batches:",file_batches)
     
@@ -457,13 +581,63 @@ def calculate_template_spectrum(datatag,wave_obs):
     plt.savefig("[%s]template.png"%datatag,dpi=200)
     '''
 
-    template_name="%s/%s.pkl"%(dynamic_dir,datatag+"-template")
+    template_name="%s/%s%s.pkl"%(dynamic_dir,subdir,datatag+"-template")
     save_batch([wave_obs[None,:],template[None,:],template_w[None,:],
                 np.array([0]),np.array([888])],template_name)
-    neid_dict["info"].update({"baseline":template,"baseline_w":template_w})
+    neid_dict["info"].update({f"{subdir}baseline":template,f"{subdir}baseline_w":template_w})
+    with open(f'{runtime_dir}/{datatag}-param.pkl',"wb") as f:
+        pickle.dump(neid_dict,f)
+    return
+
+def update_template_spectrum(datatag,wave_obs):
+    print(f'Loading from {runtime_dir}/{datatag}-param.pkl')
+    with open(f'{runtime_dir}/{datatag}-param.pkl',"rb") as f:
+        neid_dict = pickle.load(f)
+    file_batches = neid_dict["info"]["files"]
+    order_value = neid_dict["info"]["order"]
+    
+    processed = []
+    for k,batch_name in enumerate(file_batches):
+        basename = os.path.basename(batch_name).rsplit('.', 1)[0]
+        fname = f"{dynamic_dir}/processed/{basename}.pkl"
+        if os.path.isfile(fname):
+            processed.append(fname)
+    print("processed:",processed)
+    batch = merge_batch(processed)
+    _,spectrum,weights,ssbrvs,ids = [item.numpy() for item in batch]
+    
+    n_spec = spectrum.shape[-1]
+    template = np.median(spectrum,axis=0)
+    template_w = np.median(weights,axis=0)
+    dispersion =  np.zeros((n_spec))
+
+    for i in range(n_spec):
+        flux = spectrum[:,i]
+        non_zero = flux>0
+        if non_zero.sum()==0:continue
+        dispersion[i] = np.std(flux[non_zero])
+
+    '''
+    fig,ax=plt.subplots(figsize=(16,4),constrained_layout=True)
+    for i in range(50):
+        mask = spectrum[i]>0
+        ax.plot(wave_obs[mask],spectrum[i][mask],"k-",lw=1,alpha=0.1,drawstyle="steps-mid")
+    ax.plot(wave_obs,template,"r-",lw=1,drawstyle="steps-mid",label="template")
+    ax.plot(wave_obs,dispersion,"c-",lw=1,drawstyle="steps-mid",label="dispersion")
+    ax.legend()
+    #ax.set_xlim(wave_obs[300]-2,wave_obs[300]+2)
+    plt.savefig("[%s]template.png"%datatag,dpi=200)
+    '''
+
+    template_name=f"{dynamic_dir}/processed/{datatag}-template.pkl"
+    save_batch([wave_obs[None,:],template[None,:],template_w[None,:],
+                np.array([0]),np.array([888])],template_name)
+    neid_dict["info"].update({"processed_baseline":template,
+                              "processed_baseline_w":template_w})
     with open(f'{runtime_dir}/{datatag}-param.pkl',"wb") as f:
         pickle.dump(neid_dict,f)
     return 
+
 
 def calculate_v_template(datatag,wave_obs):
     print(f'Loading from {runtime_dir}/{datatag}-param.pkl')
@@ -506,6 +680,242 @@ def calculate_v_template(datatag,wave_obs):
         key = "%s"%(k)
         if key in mdict:neid_dict[k].update(mdict[key])
         else:print("%s missing..."%key)
+
+    print("Saving to %s-param.pkl..."%datatag)
+    with open(f'{runtime_dir}/{datatag}-param.pkl',"wb") as f:
+        pickle.dump(neid_dict,f)
+    return 
+
+def v_template_consistency(datatag,wave_obs):
+    print(f'Loading from {runtime_dir}/{datatag}-param.pkl')
+    with open(f'{runtime_dir}/{datatag}-param.pkl',"rb") as f:
+        neid_dict = pickle.load(f)
+
+    sample_names = neid_dict["info"]["sample_names"]
+    # calculate v_template and chi_template
+    file_batches = neid_dict["info"]["files"]
+    template = neid_dict["info"]["processed_baseline"]
+    template_w = neid_dict["info"]["baseline_w"]
+    order_value = neid_dict["info"]["order"]
+
+    processed = []
+    for k,batch_name in enumerate(file_batches[:1]):
+        basename = os.path.basename(batch_name).rsplit('.', 1)[0]
+        fname = f"{dynamic_dir}/processed/{basename}.pkl"
+        processed.append(fname)
+    print("processed:",processed)
+
+    batch = merge_batch(processed)
+    _,specs,weights,ssbrvs,ids = [item.numpy() for item in batch]
+
+    v_extra = np.linspace(-50,50,len(specs))
+    
+    v_extra = v_extra
+
+    ref_dict = {}
+    inject_dict = {}
+    for i_epoch in range(len(v_extra)):
+        # no injection
+        args = (wave_obs, specs[i_epoch], weights[i_epoch], wave_obs, template, template_w, f"{i_epoch}", order_value)
+        process_task(args,ref_dict)
+        
+        # inject v_extra
+        wave_inject = wave_obs*(1+v_extra[i_epoch]/Synthetic.c)
+        args = (wave_inject, specs[i_epoch], weights[i_epoch], wave_obs, template, template_w, f"{i_epoch}", order_value)
+        process_task(args,inject_dict)
+    
+    v_ref = np.array([ref_dict[key]['v_template'] for key in ref_dict])
+    v_inject = np.array([inject_dict[key]['v_template'] for key in ref_dict])
+    chi_ref = np.array([ref_dict[key]['chi_template'] for key in ref_dict])
+    chi_inejct = np.array([inject_dict[key]['chi_template'] for key in ref_dict])
+
+    quantile = np.quantile(v_ref,[0.16,0.84])
+    print("quantile:",quantile)
+    print(f"v_ccf rms: {0.5*(quantile[1]-quantile[0]):.3f} m/s")
+    print(f"chi : {chi_ref.mean():.3f}")
+
+    fig,axs=plt.subplots(figsize=(8,3),ncols=2,constrained_layout=True)
+    ax=axs[0]
+    ax.plot(v_extra,(v_inject-v_ref),"k.")
+    ax.plot(v_extra,v_extra,"r--",label="x=y")
+    ax.legend()
+    ax.set_xlabel("Injected Velocity [m/s]")
+    ax.set_ylabel("CCF Recovered Velocity [m/s]")
+    ax=axs[1]
+    xrange = [chi_ref.min(),chi_ref.max()]
+    ax.plot(chi_ref,chi_inejct,"k.")
+    ax.plot(xrange,xrange,"r--",label="x=y")
+    ax.legend()
+    ax.set_xlabel("$\chi_r$")
+    ax.set_ylabel("$\chi_r$ With Injected Velocity")
+    plt.savefig("v_template_check.png",dpi=200)
+    plt.clf()
+    exit()
+    return
+
+def multiple_order_v_template(tag,suffix):
+    params_file = f'{runtime_dir}{tag}_{suffix}-param.pkl'
+    print(f'Loading from {params_file}')
+    with open(params_file,"rb") as f:
+        neid_dict = pickle.load(f)
+    sample_names = neid_dict["info"]["sample_names"]
+    print(neid_dict['info']['files'])
+    # calculate v_template and chi_template
+    file_batches = neid_dict["info"]["files"]
+    wave_obs = neid_dict["info"]["wave_obs"][0]
+    template = neid_dict["info"]["baseline"]
+    template_w = neid_dict["info"]["baseline_w"]
+    order_value = neid_dict["info"]["order"]
+    #print("wave_obs:",wave_obs.shape,"template:",template.shape)
+
+    batch = merge_batch(file_batches)
+    _,specs,weights,ssbrvs,ids = [item.numpy() for item in batch]
+
+    manager = mp.Manager()
+    mdict = manager.dict()
+    # Use a pool of workers
+    pool_size = num_cores  # Number of processes in the pool
+    pool = mp.Pool(pool_size)
+    tasks = []
+    for i_epoch,obsname in enumerate(sample_names):
+        #if not obsname=="neidL2_20230603T183210.fits":continue
+        # skip existing entries
+        #if 'v_template' in neid_dict[obsname]:continue
+        # already in stellar restframe
+        task_args = (wave_obs, specs[i_epoch], weights[i_epoch], wave_obs,template,template_w, obsname, order_value)
+        tasks.append(task_args)
+
+    for i,task in enumerate(tasks):
+        pool.apply_async(process_task, args=(task, mdict))
+    # Close and join the pool
+    pool.close()
+    pool.join()
+
+    print("mdict:",mdict)
+    for k in sample_names:
+        if k in mdict:neid_dict[k].update(mdict[k])
+        else:print("%s missing..."%k)
+
+    print(f"Saving to {params_file}...")
+    with open(params_file,"wb") as f:
+        pickle.dump(neid_dict,f)
+    return 
+
+def multiple_order_v_template_consistency(tag,suffix):
+    params_file = f'{runtime_dir}{tag}_{suffix}-param.pkl'
+    print(f'Loading from {params_file}')
+    with open(params_file,"rb") as f:
+        neid_dict = pickle.load(f)
+    sample_names = neid_dict["info"]["sample_names"]
+    print(neid_dict['info']['files'])
+    # calculate v_template and chi_template
+    file_batches = neid_dict["info"]["files"]
+    wave_obs = neid_dict["info"]["wave_obs"][0]
+    template = neid_dict["info"]["baseline"]
+    template_w = neid_dict["info"]["baseline_w"]
+    order_value = neid_dict["info"]["order"]
+    #print("wave_obs:",wave_obs.shape,"template:",template.shape)
+
+    batch = merge_batch(file_batches[:1])
+    _,specs,weights,ssbrvs,ids = [item[:10].numpy() for item in batch]
+
+    v_extra = np.linspace(-10,10,len(specs))
+    v_extra = v_extra
+
+    ref_dict = {}
+    inject_dict = {}
+    for i_epoch in range(len(v_extra)):
+        # no injection
+        args = (wave_obs, specs[i_epoch], weights[i_epoch], wave_obs, template, template_w, f"{i_epoch}", order_value)
+        process_task(args,ref_dict)
+        
+        # inject v_extra
+        wave_inject = wave_obs*(1+v_extra[i_epoch]/Synthetic.c)
+        args = (wave_inject, specs[i_epoch], weights[i_epoch], wave_obs, template, template_w, f"{i_epoch}", order_value)
+        process_task(args,inject_dict)
+    
+    v_ref = np.array([ref_dict[key]['v_template'] for key in ref_dict])
+    v_inject = np.array([inject_dict[key]['v_template'] for key in ref_dict])
+    chi_ref = np.array([ref_dict[key]['chi_template'] for key in ref_dict])
+    chi_inejct = np.array([inject_dict[key]['chi_template'] for key in ref_dict])
+
+    quantile = np.quantile(v_ref,[0.16,0.84])
+    print("quantile:",quantile)
+    print(f"v_ccf rms: {0.5*(quantile[1]-quantile[0]):.3f} m/s")
+    v_resid = v_inject-v_ref-v_extra
+    print(f"v_difference rms: {v_resid.std():.3e} m/s")
+    print(f"chi : {chi_ref.mean():.3f}")
+
+    fig,axs=plt.subplots(figsize=(8,3),ncols=2,constrained_layout=True)
+    ax=axs[0]
+    ax.plot(v_extra,(v_inject-v_ref),"k.")
+    ax.plot(v_extra,v_extra,"r--",label="x=y")
+    ax.legend()
+    ax.set_xlabel("Injected Velocity [m/s]")
+    ax.set_ylabel("CCF Recovered Velocity [m/s]")
+    ax=axs[1]
+    xrange = [chi_ref.min(),chi_ref.max()]
+    ax.plot(chi_ref,chi_inejct,"k.")
+    ax.plot(xrange,xrange,"r--",label="x=y")
+    ax.legend()
+    ax.set_xlabel("$\chi_r$")
+    ax.set_ylabel("$\chi_r$ With Injected Velocity")
+    plt.savefig("v_template_check.png",dpi=200)
+    plt.clf()
+    exit()
+    return
+
+def update_v_template(datatag,wave_obs):
+    print(f'Loading from {runtime_dir}/{datatag}-param.pkl')
+    with open(f'{runtime_dir}/{datatag}-param.pkl',"rb") as f:
+        neid_dict = pickle.load(f)
+
+    sample_names = neid_dict["info"]["sample_names"]
+    # calculate v_template and chi_template
+    file_batches = neid_dict["info"]["files"]
+    template = neid_dict["info"]["processed_baseline"]
+    template_w = neid_dict["info"]["baseline_w"]
+    order_value = neid_dict["info"]["order"]
+
+    processed = []
+    for k,batch_name in enumerate(file_batches):
+        basename = os.path.basename(batch_name).rsplit('.', 1)[0]
+        fname = f"{dynamic_dir}/processed/{basename}.pkl"
+        processed.append(fname)
+    print("processed:",processed)
+
+    batch = merge_batch(processed)
+    _,specs,weights,ssbrvs,ids = [item.numpy() for item in batch]
+
+    manager = mp.Manager()
+    mdict = manager.dict()
+    # Use a pool of workers
+    pool_size = num_cores  # Number of processes in the pool
+    pool = mp.Pool(pool_size)
+    tasks = []
+    for i_epoch,obsname in enumerate(sample_names):
+        # skip existing entries
+        #if 'v_template' in neid_dict[obsname]:continue
+        # already in stellar restframe
+        task_args = (wave_obs, specs[i_epoch], weights[i_epoch], wave_obs,template,template_w, obsname, order_value)
+        tasks.append(task_args)
+
+    for i,task in enumerate(tasks):
+        pool.apply_async(process_task, args=(task, mdict))
+    # Close and join the pool
+    pool.close()
+    pool.join()
+
+
+    mdict_update = {}
+    for k in mdict:
+        mdict_update[k] = {}
+        for col in mdict[k]:
+            mdict_update[k][f"{col}_processed"]=mdict[k][col]    
+
+    for k in sample_names:
+        if k in mdict_update:neid_dict[k].update(mdict_update[k])
+        else:print("%s missing..."%k)
 
     print("Saving to %s-param.pkl..."%datatag)
     with open(f'{runtime_dir}/{datatag}-param.pkl',"wb") as f:
@@ -565,23 +975,30 @@ def detect_bad_pixel(data,sigma=1.5,snr=3,radius=2):
     #print("badmask:",badmask.sum())
     return badmask
 
-def preview_spectrum(obsname,order_value,quality_mask):
-    data,info_dict = prepare_spectrum_single_order(obsname,quality_mask,order_value)
+def preview_spectrum(ax,obsname,order_value,quality_mask):
+    data,info_dict = prepare_spectrum_single_order(obsname,quality_mask,order_value,telluric=True)
     wavelength,spectrum,spectrum_err = data
 
+    spec_telluric = info_dict['telluric_model']
+    #spec_telluric /= spec_telluric.max()
+    print("order",order_value,"spec_telluric",spec_telluric.min(),spec_telluric.max())
+    
+    #spec_telluric = 1-(10*(1-spec_telluric))
+    print(spec_telluric.shape)
+
+    #telluric = info_dict['telluric_model']
     ylim=[0,max(1.2,spectrum.max())]
-    fig, ax = plt.subplots(figsize=(15,3),dpi=200,constrained_layout=True)
 
     ax.set_title("Order %d"%order_value)
-    ax.plot(wavelength,spectrum,"k-",lw=1,label="data",drawstyle="steps-mid")
-    #ax.plot(wavelength[i],spec_smooth[i],"b-",lw=1,label="smooth",drawstyle="steps-mid")
+    ax.plot(wavelength,spectrum,"k-",lw=1,label="corrected",drawstyle="steps-mid")
+    ax.plot(wavelength,spec_telluric,"b-",lw=1,label="telluric",drawstyle="steps-mid")
+    #ax.plot(wavelength,spectrum/spec_telluric,"r-",lw=1,label="correction",drawstyle="steps-mid")
     #ax.plot(wavelength[i],ydiff[i],"r-",lw=1,drawstyle="steps-mid")
     ax.fill_between(wavelength,spectrum-spectrum_err,
                     spectrum+spectrum_err,step="mid",
                     color="k",alpha=0.3,zorder=-10)
-    ax.legend()
+    ax.legend(loc=3)
     ax.set_ylim(ylim)
-    plt.savefig("[%s]single-obs.png"%tag)
     return
 
 def initialize_restframe_model(wave_obs,template,weight):
@@ -617,7 +1034,7 @@ def print_string(vname,v,mode="1"):
     print("%s: %s"%(vname,string))
     return
 
-def plot_sample_selection(axs, timestamp,v_template,v_ccf,fit_chi,order, 
+def plot_sample_selection(axs, timestamp,v_template,v_ccf,our_ccf,fit_chi,order, 
                           grey_color = "grey", bright_color = "k"):
     ax=axs[0]
     ax.scatter(NEID_JD,NEID_CCFRV,c="grey",s=5,label="all (N=%d)"%len(NEID_JD))
@@ -628,9 +1045,10 @@ def plot_sample_selection(axs, timestamp,v_template,v_ccf,fit_chi,order,
     ax=axs[1]
     ax.scatter(timestamp,v_template,c=bright_color,s=3,
                label="$v_{template}$ RMS = %.2f m/s"%(v_template.std()))
-    ax.scatter(timestamp,v_ccf,c=grey_color,s=3,label="$v_{CCF}$ RMS = %.2f m/s"%(v_ccf.std()))
+    ax.scatter(timestamp,v_ccf,c=grey_color,s=2,label="$v_{CCF,NEID}$ RMS = %.2f m/s"%(v_ccf.std()))
+    ax.scatter(timestamp,our_ccf,c='r',s=2,label="$v_{CCF,Clean}$ RMS = %.2f m/s"%(our_ccf.std()))
 
-    ax.legend(title="Discrepancy RMS = %.2f m/s"%template_ccf_offset.std())
+    ax.legend(title="Discrepancy RMS = %.2f m/s"%(v_template-our_ccf).std())
     ax.set_xlabel("JD")
     ax.set_ylabel("RV [m/s]")
     ax=axs[2]
@@ -642,6 +1060,41 @@ def plot_sample_selection(axs, timestamp,v_template,v_ccf,fit_chi,order,
     #plt.savefig("[%s]sample-selection.png"%datatag,dpi=300)
     #plt.clf()
     return
+
+def moving_std_weight_batch_torch(data, valid_mask, window_size=6):
+    # Input: data and valid_mask are tensors of shape (B, N)
+    # Ensure float dtype
+    data = data.float()
+    valid_mask = valid_mask.float()
+
+    # Compute cumulative sums for data, data², and mask
+    cumsum = torch.cumsum(data, dim=1)
+    cumsum2 = torch.cumsum(data ** 2, dim=1)
+    valid_cumsum = torch.cumsum(valid_mask, dim=1)
+
+    # Compute moving sums using cumulative sum trick
+    moving_sum = cumsum[:, window_size:] - cumsum[:, :-window_size]
+    moving_sum2 = cumsum2[:, window_size:] - cumsum2[:, :-window_size]
+    valid_count = valid_cumsum[:, window_size:] - valid_cumsum[:, :-window_size]
+
+    # Initialize variance tensor
+    var = torch.zeros_like(moving_sum)
+    good = valid_count > 3
+
+    # Compute variance where valid
+    var[good] = moving_sum2[good] / valid_count[good]
+    var[good] -= (moving_sum[good] / valid_count[good]) ** 2
+
+    # Handle invalid cases with large value
+    large_value = 1e12
+    var[~good] = large_value
+
+    # Pad on both sides to match original sequence length
+    pad_left = var[:, 0:1].repeat(1, window_size // 2)
+    pad_right = var[:, -1:].repeat(1, window_size // 2)
+    var_padded = torch.cat([pad_left, var, pad_right], dim=1)
+
+    return 1.0 / var_padded
 
 def moving_std_weight_batch(data,valid_mask,window_size=6):
     # Ensure data is a 2D numpy array
@@ -708,7 +1161,7 @@ def plot_continuum(spec,w,spec_input,f_continuum,b_poly,template):
     exit()
 
 # Define the objective function
-def continuum_loss(param, y_perturb, weight, y_quiet, smooth_radius = 12, full=False):
+def continuum_loss(param, y_perturb, weight, y_quiet, smooth_radius = 15, full=False):
     b = param
     b_poly = b
 
@@ -734,6 +1187,8 @@ def continuum_worker(batch_name,save_name,template):
     spec_input = spec - template
     w_std = moving_std_weight_batch(spec-template,w_raw>1)
     w = 1/(1/w_std+1/w_raw)
+    spec_input[w<1] = 0
+    #'''
     for i in range(spec_input.shape[0]):
         #if i<=10:continue
         result = minimize(continuum_loss,[0.0001], args=(spec[i],w[i],template))
@@ -741,6 +1196,7 @@ def continuum_worker(batch_name,save_name,template):
         loss,y_recover,f_continuum,b_poly = continuum_loss(pbest,spec[i],w[i],template,full=True)
         spec_input[i,w[i]>1] = (y_recover - template)[w[i]>1]
         #plot_continuum(spec[i],w[i],spec_input[i],f_continuum,b_poly,template)
+    #'''
     save_batch([np.zeros_like(jd),spec_input,w,ssbrv,jd],save_name)
     return
 
@@ -750,7 +1206,6 @@ def correct_for_continuum(datatag,instrument,template_data):
         neid_dict = pickle.load(f)
     file_batches = neid_dict["info"]["files"]
     template = neid_dict["info"]["baseline"]
-    print("template:",template.shape)
     wave_obs = tensor2array(template_data[0])[0]
     print("wave_obs:",wave_obs.shape)
     print("file_batches:",file_batches)
@@ -771,6 +1226,411 @@ def correct_for_continuum(datatag,instrument,template_data):
     print("process_list",process_list)
     for i_start in range(0, len(process_list), num_cores):
         print("[continuum]Currently running #%i - #%i"%(i_start, min(i_start+num_cores,len(process_list))))
+        running_list = process_list[i_start:i_start+num_cores]
+        [p.start() for p in running_list]
+        [p.join()  for p in running_list]
+    return
+
+def correct_for_bulk_offset(datatag):
+    print(f'Loading from {runtime_dir}{datatag}-param.pkl')
+    with open(f'{runtime_dir}{datatag}-param.pkl',"rb") as f:
+        neid_dict = pickle.load(f)
+    file_batches = neid_dict["info"]["files"]
+    sample_names = neid_dict["info"]["sample_names"]
+    timestamp = get_timeseries(neid_dict,'timestamp',sample_names)
+    v_template = get_timeseries(neid_dict,'v_template',sample_names)
+    t_segments = [[0,800],[800,1600]]
+    bulk_velocity = []
+    for seg in t_segments: 
+        mask = (timestamp>=seg[0])&(timestamp<seg[1])
+        bulk_velocity.append(np.median(v_template[mask]))
+    print("bulk_velocity:",bulk_velocity)
+    print("file_batches:",file_batches)
+
+    for k,batch_name in enumerate(file_batches):
+        print("Loading %s..."%batch_name)
+        datatag = os.path.basename(batch_name).rsplit('.', 1)[0]
+        save_name = f"{dynamic_dir}/bulk_velocity/{datatag}.pkl"
+        #continuum_worker(batch_name,save_name,template)
+        print ("saving batch  %d / %d"%(k,len(file_batches)))
+        wave_raw,spec_raw,w,ssbrv,jd = load_batch(batch_name)
+        v_bulk = torch.zeros_like(ssbrv)
+        for i,seg in enumerate(t_segments): 
+            mask = (jd>=seg[0])&(jd<seg[1])
+            v_bulk[mask] = bulk_velocity[i]
+        z_bulk = v_bulk/Synthetic.c
+        wave_shifted = wave_raw*(1-z_bulk)
+
+        print("saving to %s..."%save_name)
+        with open(save_name, 'wb') as f:
+            pickle.dump([wave_shifted,spec_raw,w,ssbrv,jd], f)
+    return
+
+def correct_for_telluric_lines(datatag,instrument,template_data,skymodel,skymask):
+    print("\n\n Correcting for telluric lines and continuum...")
+    params_file = f'{runtime_dir}{datatag}-param.pkl'
+    print(f'Loading from {params_file}')
+    with open(params_file,"rb") as f:
+        neid_dict = pickle.load(f)
+    file_batches = neid_dict["info"]["files"]
+    template = template_data[1]
+    print("template:",template.shape)
+    print("file_batches:",file_batches)
+    
+    for k,batch_name in enumerate(file_batches):
+        print("Loading %s..."%batch_name)
+        datatag = os.path.basename(batch_name).rsplit('.', 1)[0]
+        save_name = f"{dynamic_dir}/processed/{datatag}.pkl"
+
+        batch = load_batch(batch_name)
+        batch = [item.to(device=device) for item in batch]
+        print("batch_name:",batch_name)
+        spectra, w, ssbrv, jd = evaluate_sky_model(skymodel,batch,template,skymask)
+        save_batch([np.zeros_like(jd),spectra,w,ssbrv,jd],save_name)
+    return
+
+def merge_multiple_orders(tag,ORDERS,suffix,sample_names,batch_size):
+    idx = np.arange(0, len(sample_names), batch_size)
+    batches = np.array_split(sample_names, idx[1:])
+    
+    templates = []
+    skymasks = []
+    merge_dict = {}
+
+    info_keys = ['OBSJD','DATE-OBS','AIRMASS','WVAPOR','E_VER','ZENITH',
+                 'CCFRVMOD','DVRMSMOD','timestamp']
+
+    merge_dict['info'] = {'sample_names':sample_names,"order":ORDERS}
+
+    for i,order in enumerate(ORDERS):
+        datatag = f"{tag}_order{order}_{suffix}"
+        template_name = f"{dynamic_dir}/{datatag}-template.pkl"
+        skymask_file = f"{dynamic_dir}/skymask/{datatag}-skymask.pkl"
+
+        params_file = f'{runtime_dir}{datatag}-param.pkl'
+        print(f'Loading from {params_file}')
+        with open(params_file,"rb") as f:
+            neid_dict = pickle.load(f)
+        for obsname in neid_dict:
+            if obsname=='info':continue
+            select = {key:neid_dict[obsname][key] for key in info_keys}
+            if not obsname in merge_dict:merge_dict[obsname] = select
+
+        template_data = load_batch(template_name)
+        template_data = [item.to(device=device) for item in template_data]
+        templates.append(template_data)
+        skymasks.append(load_batch(skymask_file).bool())
+
+    filenames = []
+    for k in range(len(batches)):
+        save_name = f"{dynamic_dir}/merge/{tag}_{suffix}_{k}.pkl"
+        filenames.append(save_name)
+        if os.path.isfile(save_name):
+            print(f"{save_name} already exists...")
+            continue
+        combined_spectra = []
+        combined_w = []
+        for i,order in enumerate(ORDERS):
+            datatag = f"{tag}_order{order}_{suffix}"
+            batch_name = f"{dynamic_dir}/{datatag}_{k}.pkl"
+            skymodel_file = f"skymodel/poly_order{order}_full.pt"
+
+            print("batch_name:",batch_name)
+            print("template_name:",template_name)
+
+            wave_obs,template = templates[i][:2]
+            instrument = Synthetic(wave_obs)
+
+            skymodel,losses = load_model(skymodel_file,instrument)
+            batch = load_batch(batch_name)
+            batch = [item.to(device=device) for item in batch]
+            print("batch_name:",batch_name,)
+            spectra, w, ssbrv, jd = evaluate_sky_model(skymodel,batch,template,skymasks[i])
+            print("spectra:",spectra.shape,"w:",w.shape,"jd:",jd.shape)
+            combined_spectra.append(spectra)
+            combined_w.append(w)
+        combined_spectra = np.concatenate(combined_spectra,axis=1)
+        combined_w = np.concatenate(combined_w,axis=1)
+        print("combined_spectra:",combined_spectra.shape,
+              "combined_w:",combined_w.shape,"jd:",jd.shape)
+        print(f"saving to {save_name}...")
+        save_batch([np.zeros_like(jd),combined_spectra,combined_w,ssbrv,jd],save_name)
+
+    # update spectral template
+    combined_wave_obs = torch.cat([item[0] for item in templates],dim=1)
+    print("combined_wave_obs:",combined_wave_obs.shape)
+    combined_wave_obs = tensor2array(combined_wave_obs)
+    
+    print("filenames:",filenames)
+    batch = merge_batch(filenames)
+    _,spectrum,weights,ssbrvs,ids = [item.numpy() for item in batch]
+    print("spectrum:",spectrum.shape)
+
+    n_spec = spectrum.shape[-1]
+    template = np.zeros((n_spec))
+    template_w = np.zeros((n_spec))
+    dispersion =  np.zeros((n_spec))
+
+    for i in range(n_spec):
+        flux = spectrum[:,i]
+        w = weights[:,i]
+        good = (flux>0)&(w>1)
+        if good.sum()==0:continue
+        template[i] = np.median(flux[good])
+        template_w[i] = np.median(w[good])
+        dispersion[i] = np.std(flux[good])
+
+    merge_dict['info']['files'] = filenames
+    merge_dict['info']['wave_obs'] = combined_wave_obs
+    merge_dict['info']['baseline'] = template
+    merge_dict['info']['baseline_w'] = template_w
+
+    params_file = f'{runtime_dir}{tag}_{suffix}-param.pkl'
+    print(f"Saving to {params_file}...")
+    with open(params_file,"wb") as f:
+        pickle.dump(merge_dict,f)
+
+    template_name=f"{dynamic_dir}/merge/{datatag}-template.pkl"
+    save_batch([combined_wave_obs,template[None,:],template_w[None,:],
+                np.array([0]),np.array([888])],template_name)
+    #'''
+    fig,ax=plt.subplots(figsize=(16,3),constrained_layout=True)
+    for i in range(50):
+        mask = spectrum[i]>0
+        ax.plot(combined_wave_obs[0][mask],spectrum[i][mask],"k-",lw=1,alpha=0.1,drawstyle="steps-mid")
+    ax.plot(combined_wave_obs[0],template,"r-",lw=1,drawstyle="steps-mid",label="template")
+    ax.plot(combined_wave_obs[0],100*dispersion,"c-",lw=1,drawstyle="steps-mid",label="100xdispersion")
+    ax.legend()
+    #ax.set_xlim(wave_obs[300]-2,wave_obs[300]+2)
+    plt.savefig("[%s]template.png"%datatag,dpi=200)
+    #'''
+    return
+
+def compute_ccf(spec_tensor, w_tensor, wavelength, template, 
+                velocity_grid=np.linspace(-15, 15, 201),v_extra=None):
+
+    spectra = tensor2array(spec_tensor)
+    weights = tensor2array(w_tensor)
+
+    N_spectra, N_pixels = spectra.shape
+
+    # Initialize CCF matrix
+    ccf_matrix = np.zeros((N_spectra, len(velocity_grid)))
+    # Speed of light in km/s
+    c = 299792.458
+
+    if v_extra is None: v_extra=np.zeros((N_spectra))
+
+    wmin = wavelength.min()/(1 + velocity_grid.min() / c)
+    wmax = wavelength.max()/(1 + velocity_grid.max() / c)
+    goodmask = (template<1)&(wavelength>wmin)&(wavelength<wmax)
+
+    template_interp = interp1d(wavelength[goodmask], template[goodmask], kind='cubic', bounds_error=False, fill_value=0.0)
+
+    shifted_template = np.zeros((len(velocity_grid),N_pixels))
+    for i, velocity in enumerate(velocity_grid):
+        # Doppler shift the template wavelengths
+        shifted_wavelength = wavelength * (1 - velocity / c)
+        shifted_template[i] = template_interp(shifted_wavelength)
+
+    # Compute cross-correlation for each spectrum
+    for j in range(N_spectra):
+        #valid = (weights[j]>1)&(shifted_template!=1)
+        bad = weights[j]<1
+        spectra_shifted = interp1d(wavelength[~bad]* (1.0+v_extra[j]/c), spectra[j][~bad], kind='cubic', bounds_error=False, fill_value=1.0)(wavelength)
+        for i in range(len(velocity_grid)):
+            ccf_matrix[j, i] = np.sum(spectra_shifted * shifted_template[i])
+    # Normalize CCF to range [0, 1]
+    ccf_matrix = (ccf_matrix) / (
+        np.max(ccf_matrix, axis=1, keepdims=True)
+    )
+    return ccf_matrix, velocity_grid
+
+def fit_gaussian_ccf(velocity_grid, ccf):
+    """
+    Fit a Gaussian to the CCF to determine the velocity offset.
+    
+    Parameters:
+        velocity_grid (numpy.ndarray): 1D array of velocity values (km/s).
+        ccf (numpy.ndarray): 1D array of normalized CCF values.
+    
+    Returns:
+        popt (tuple): Best-fit parameters (amplitude, mean, sigma, offset).
+        velocity_offset (float): The best-fit Gaussian center (km/s).
+    """
+    # Initial guesses
+    a_init = np.min(ccf)-np.max(ccf)  # Amplitude (min of CCF)
+    mu_init = velocity_grid[np.argmin(ccf)] # Initial guess for center
+    sigma_init = 4  # Rough estimate of width
+    c_init = np.max(ccf)  # Baseline
+
+    p0 = [a_init, mu_init, sigma_init, c_init]
+
+    # Fit Gaussian to CCF
+    #popt, pcov = curve_fit(gaussian_ccf, velocity_grid, ccf, p0=p0)
+    res = minimize(gaussian_ccf_chi, p0, method='Nelder-Mead', args=(velocity_grid,ccf),tol=1e-7)
+    popt = res.x
+    chi = res.fun
+    # Extract velocity offset (Gaussian mean)
+    velocity_offset = popt[1]
+    '''
+    print("velocity_offset:",velocity_offset*1e3,"chi:",chi)
+    y_gauss = gaussian_ccf_chi(popt,velocity_grid,ccf,full=True)
+    y0 = gaussian_ccf_chi(p0,velocity_grid,ccf,full=True)
+    plt.plot(velocity_grid,ccf,'k-')
+    plt.plot(velocity_grid,y0,'b-',lw=1)
+    plt.plot(velocity_grid,y_gauss,'r-',lw=1)
+    plt.axvline(popt[1],ls='--',color="grey",label=f"v={popt[1]*1e3:.2f}m/s")
+    plt.legend()
+    plt.savefig("test.png",dpi=200)
+    exit()
+    '''
+    return popt, velocity_offset, chi
+
+def compute_bisspan(velocity_grid,ccf_matrix):
+    v_ccf = np.zeros((ccf_matrix.shape[0],2))
+    params =  np.zeros((ccf_matrix.shape[0],4))
+    mask = np.abs(velocity_grid)<=5.0
+    for i,ccf in enumerate(ccf_matrix):
+        popt, velocity_offset, chi = fit_gaussian_ccf(velocity_grid[mask], ccf[mask])
+        v_ccf[i][0] = velocity_offset*1e3
+        v_ccf[i][1] = chi
+        params[i] = popt
+    #v_ccf[:,0] -= v_ccf[:,0].mean()
+
+    pos = velocity_grid>0
+    depth = ccf_matrix.max()-ccf_matrix.min()
+    depths_top = 1-np.linspace(0.1, 0.4, 20)*depth
+    depths_bottom = 1-np.linspace(0.6, 0.9, 20)*depth
+    bisspan = np.zeros((ccf_matrix.shape[0]))
+
+    for i,ccf in enumerate(ccf_matrix):
+        left_half = interp1d(ccf[~pos],velocity_grid[~pos],kind="linear")
+        right_half =  interp1d(ccf[pos],velocity_grid[pos],kind="linear")
+
+        v_top = np.array([np.mean([left_half(x),right_half(x)]) for x in depths_top])
+        v_bottom = np.array([np.mean([left_half(x),right_half(x)]) for x in depths_bottom])
+        bisspan[i] = np.mean(v_top)-np.mean(v_bottom)
+    return params,v_ccf,bisspan
+
+def check_ccf_consistency(spectra,w,wave_obs,template):
+    v_extra = np.linspace(-0.05,0.05,len(spectra))
+    ccf_matrix, velocity_grid = compute_ccf(spectra, w, wave_obs, 1-template)
+    params,v_ccf,bisspan = compute_bisspan(velocity_grid,ccf_matrix)
+    
+    ccf_matrix, velocity_grid = compute_ccf(spectra, w, wave_obs, 1-template,v_extra=v_extra)
+    params,v_ccf_inject,bisspan_inject = compute_bisspan(velocity_grid,ccf_matrix)
+
+    quantile = np.quantile(v_ccf[:,0],[0.16,0.84])
+    print("quantile:",quantile)
+    print(f"v_ccf rms: {0.5*(quantile[1]-quantile[0]):.3f} m/s")
+    print(f"chi : {v_ccf[:,1].mean():.3f}")
+
+    v_extra*=1e3
+    bisspan*=1e3
+    bisspan_inject*=1e3
+
+    fig,axs=plt.subplots(figsize=(8,3),ncols=2,constrained_layout=True)
+    ax=axs[0]
+    ax.plot(v_extra,(v_ccf_inject[:,0]-v_ccf[:,0]),"k.")
+    ax.plot(v_extra,v_extra,"r--",label="x=y")
+    ax.legend()
+    ax.set_xlabel("Injected Velocity [m/s]")
+    ax.set_ylabel("CCF Recovered Velocity [m/s]")
+    ax=axs[1]
+    xrange = [bisspan.min(),bisspan.max()]
+    ax.plot(bisspan,bisspan_inject,"k.")
+    ax.plot(xrange,xrange,"r--",label="x=y")
+    ax.legend()
+    ax.set_xlabel("BISSPAN [m/s]")
+    ax.set_ylabel("BISSPAN with Injected Velocity [m/s]")
+    plt.savefig("bisspan.png",dpi=200)
+    plt.clf()
+    exit()
+    return
+
+def ccf_worker(batch_name,save_name,wave_obs,template,timetable):
+    batch = load_batch(batch_name)
+    print("[ccf worker]batch_name:",batch_name)
+    #_,spec_input,w,ssbrv,jd = batch
+    #spectra = tensor2array(spec_input) + template
+    _,spectra,w,ssbrv,jd = batch
+
+    v_template = [timetable[t]["v_template"] for t in tensor2array(jd[:,0])]
+    v_template = np.array(v_template)
+    #check_ccf_consistency(spectra,w,wave_obs,template)
+
+    print("compute_ccf...")
+    ccf_matrix, velocity_grid = compute_ccf(spectra, w, wave_obs, 1-template)
+    params,v_ccf,bisspan = compute_bisspan(velocity_grid,ccf_matrix)
+    print(f"v_ccf RMS:{v_ccf[:,0].std():.3f} m/s  chi:{v_ccf[:,1].mean():.2f}")
+    print(f"v_template RMS:{v_template.std():.3f} m/s ")
+    print(f"Difference RMS:{(v_template-v_ccf[:,0]).std():.3f} m/s ")
+
+    depth,_,sigma,c = params.T
+
+    input_features = np.vstack((v_template,v_ccf[:,0],depth,bisspan,sigma,c)).T
+    print("saving to %s..."%save_name)
+    input_features = torch.from_numpy(input_features.astype(np.double))
+    template_new = torch.from_numpy((template).astype(np.float32))[None,:]
+    spec_input = spectra - template_new
+    spec_input[w<1] = 0
+    print("spec_input:",spec_input.shape)
+    with open(save_name, 'wb') as f:
+        pickle.dump([input_features,spec_input,w,ssbrv,jd], f)
+    return
+
+
+def add_ccf_trad_indicators(datatag):
+    print("\n\nAdd CCF INFO...")
+    params_file = f'{runtime_dir}{datatag}-param.pkl'
+    print(f'Loading from {params_file}')
+    with open(params_file,"rb") as f:
+        neid_dict = pickle.load(f)
+    file_batches = neid_dict["info"]["files"]
+    try:template = neid_dict["info"]['processed_baseline']
+    except: template = neid_dict["info"]['baseline']
+
+    print("keys:",neid_dict["info"].keys())
+    wave_obs = neid_dict["info"]["wave_obs"][0]
+    sample_names = neid_dict["info"]["sample_names"]
+
+    # Create a time-to-parameters mapping
+    timetable = {np.float32(neid_dict[item]["timestamp"]): neid_dict[item] for item in sample_names}
+
+    #template = neid_dict["info"]['baseline']
+    print("template:",template.shape)
+    print("wave_obs:",wave_obs.shape)
+    print("file_batches:",file_batches)
+
+    v_template = get_timeseries(neid_dict,'v_template',sample_names)
+    print_string("$v_{template}$",v_template,mode="2")
+
+    process_list = []
+    manager = mp.Manager()
+    mdict = manager.dict()
+    ccf_files = []
+    for k,batch_name in enumerate(file_batches):
+        print("Loading %s..."%batch_name)
+        datatag = os.path.basename(batch_name).rsplit('.', 1)[0]
+        #load_name = f"{dynamic_dir}/processed/{datatag}.pkl"
+        load_name = f"{dynamic_dir}/merge/{datatag}.pkl"
+        save_name = f"{dynamic_dir}/ccf_info/{datatag}.pkl"
+
+        ccf_files.append(save_name)
+        print ("saving batch  %d / %d"%(k,len(file_batches))) 
+        work_p = mp.Process(target=ccf_worker,
+                            args=(load_name,save_name,wave_obs,template,timetable))
+        process_list.append(work_p)
+
+    #neid_dict["info"]["ccf_files"] = ccf_files
+    #print(f"Saving to {params_file}...")
+    #with open(params_file,"wb") as f:
+    #    pickle.dump(neid_dict,f)
+
+    print("process_list",process_list)
+    for i_start in range(0, len(process_list), num_cores):
+        print("[ccf]Currently running #%i - #%i"%(i_start, min(i_start+num_cores,len(process_list))))
         running_list = process_list[i_start:i_start+num_cores]
         [p.start() for p in running_list]
         [p.join()  for p in running_list]
@@ -822,10 +1682,10 @@ parser = argparse.ArgumentParser(description='Description of your script')
 
 # Define optional arguments with default values
 parser.add_argument('-t', '--tag', help='Tag description', default='test')
-parser.add_argument('-when', '--when', help='Before or after the fire', default='a')
+parser.add_argument('-when', '--when', help='Before or after the fire', default='full')
 parser.add_argument('-n', '--samples', type=int, help='Number of samples', default=100)
 parser.add_argument('-batch', '--batch_size', type=int, help='Batch size', default=500)
-parser.add_argument('-cpu', '--num_cores', type=int, help='Number of CPU cores', default=10)
+parser.add_argument('-cpu', '--num_cores', type=int, help='Number of CPU cores', default=80)
 parser.add_argument('-load', '--load_data', action='store_true', help='Load data')
 #parser.add_argument('-o','--orders', nargs='+', help='<Required> Orders', required=True)
 
@@ -843,9 +1703,12 @@ load_data = args.load_data
 #ORDERS = [int(o) for o in args.orders]
 #ORDERS = np.arange(65,100)
 #ORDERS = np.arange(41,100)
-#ORDERS = np.arange(15,20)
-ORDERS = [50,51]
-ORDERS = [i for i in ORDERS if not i in blacklist]
+#ORDERS = np.arange(45,55)
+#ORDERS = [i for i in ORDERS if not i in blacklist]
+#ORDERS = [50,51,52,53,54]
+#ORDERS = [59,60,61,62,63,64,65,66,67]
+
+ORDERS = [56]
 print("ORDERS:",ORDERS)
 print(" ".join([str(i) for i in ORDERS[1::2]]))
 
@@ -868,6 +1731,9 @@ if args.when =="a":
 elif args.when =="b":
     suffix = "before"
     goodmask = (data['jd']<2459800.0)
+elif args.when =="full":
+    suffix = "full"
+    goodmask = (data['jd']>0.0)
 else:
     print("invalid argument %s"%args.when)
     exit()
@@ -885,13 +1751,28 @@ sel = np.nonzero(np.in1d(NEID_FILENAMES, existing_files))[0]
 print("total number:",len(sel))
 np.random.shuffle(sel)
 SELECT = sel[:n_sample]
-
-#for order in ORDERS:
-#    preview_spectrum("neidL2_20211109T204628.fits",
-#                     order,quality_mask=quality_mask[order])
-
 raw_sample_names = list(NEID_FILENAMES[SELECT])
 print("Selected samples:",len(raw_sample_names))
+print("raw_sample_names:",raw_sample_names)
+#np.savetxt("test_sample_names_100.txt",raw_sample_names, fmt="%s")
+#exit()
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#merge_multiple_orders(tag,ORDERS,suffix,raw_sample_names,batch_size)
+#multiple_order_v_template(tag,suffix)
+#add_ccf_trad_indicators(f"{tag}_{suffix}")
+#multiple_order_v_template_consistency(tag,suffix)
+
+#exit()
+'''
+fig, axs = plt.subplots(figsize=(15,2*n_order),nrows=n_order,dpi=200,constrained_layout=True)
+for i,order in enumerate(ORDERS):
+    preview_spectrum(axs[i],'neidL2_20220420T201416.fits',
+                     order,quality_mask=quality_mask[order])
+    plt.savefig("[%s]single-obs.png"%tag)
+'''
+
+#torch.cuda.set_device('cuda:1')
+#device = torch.device('cuda')
 
 for i,order in enumerate(ORDERS):    
     datatag = "%s_order%d_%s"%(tag,order,suffix)
@@ -899,20 +1780,27 @@ for i,order in enumerate(ORDERS):
         print("wrapping order:",order)
         wrap_data(raw_sample_names,datatag,batch_size,order,quality_mask[order])
         calculate_template_spectrum(datatag,input_wave[i])
-        ##calculate_v_template(datatag,input_wave[i])
+        calculate_v_template(datatag,input_wave[i])
         template_data = load_batch("%s/%s-template.pkl"%(dynamic_dir,datatag))
-        instrument = Synthetic(template_data[0])
-        correct_for_continuum(datatag,instrument,template_data)
-        #daily_average_spectrum(datatag)
-        exit()
+        template_data = [item.to(device=device) for item in template_data]
 
-        # remove the pre-post fire wavelength calib offset
-        #print("Correcting for the bulk v offset...")
-        #correct_v_bulk_offset(datatag)
-        # redo template caculation
-        #calculate_template_spectrum(datatag,input_wave[i])
-        # redo v offest calculation
-        #calculate_v_template(datatag,input_wave[i])
+        wave_obs = template_data[0]
+        instrument = Synthetic(wave_obs)
+
+        '''
+        model_file = f"skymodel/poly_order{order}_full.pt"
+        skymask = load_batch("%s/skymask/%s-skymask.pkl"%(dynamic_dir,datatag)).bool()
+        skymodel,losses = load_model(model_file,instrument)
+        correct_for_telluric_lines(datatag,instrument,template_data,
+                                   skymodel,skymask)
+        update_template_spectrum(datatag,input_wave[i])
+        update_v_template(datatag,input_wave[i])
+        v_template_consistency(datatag,input_wave[i])
+        add_ccf_trad_indicators(datatag,instrument,input_wave[i])
+        '''
+        #exit()
+        #daily_average_spectrum(datatag)
+    #else: calculate_v_template(datatag,input_wave[i])
 
     print("Loading from %s-param.pkl"%datatag)
     with open(f'{runtime_dir}/{datatag}-param.pkl',"rb") as f:
@@ -920,36 +1808,91 @@ for i,order in enumerate(ORDERS):
     sample_names = neid_dict["info"]["sample_names"]
     timestamp = get_timeseries(neid_dict,'timestamp',sample_names)
     jds = get_timeseries(neid_dict,'OBSJD',sample_names)
-    v_template = get_timeseries(neid_dict,'v_template',sample_names)
-    fit_chi = get_timeseries(neid_dict,'chi_template',sample_names)
-    ccfrv = get_timeseries(neid_dict,'CCFRV',sample_names)
+    #print("info",neid_dict["data"].keys())
+
+
+    SSBRV = get_timeseries(neid_dict,'SSBRV',sample_names)
+    CCFRV = get_timeseries(neid_dict,'CCFRV',sample_names)
     water_vapor = get_timeseries(neid_dict,'WVAPOR',sample_names)
-    
-    v_ccf = ccfrv-np.median(ccfrv)
-    template_ccf_offset = v_template-v_ccf
+    print("SSBRV:",SSBRV.min(),SSBRV.max())
 
+    CCFRV = CCFRV-np.mean(CCFRV)
     print("\nOrder %d:"%order)
-    print_string("base_chi",fit_chi)
-    if fit_chi.mean()>2:
-        print("Mean $\chi^2 > 10$, skip order %d..."%order)
-        blacklist.append(order)
-        title_color = "r"
-    else: title_color = "k"
+    #print_string("base_chi",fit_chi)
+    title_color = "k"
 
-    print_string("$v_{CCF}$",v_ccf,mode="2")
-    print_string("$v_{template}$",(v_template),mode="2")
-    print_string("$v_{template}-v_{CCF}$",
-                 template_ccf_offset,mode="2")
-    v_template -= np.median(v_template)
+    if not "ccf_files" in neid_dict["info"]:
+        file_batches = neid_dict["info"]["files"]
+        print("file_batches:",file_batches)
+        # load generated data
+        batch = merge_batch(file_batches[:3])
+        wave_raw,spec_raw,weights,ssbrvs,ids = [item.numpy() for item in batch]
+
+        wave_mean = np.mean(wave_raw,axis=0,keepdims=True)
+        wave_std = (wave_raw-wave_mean).std(axis=0)
+        wave_mean = wave_mean[0]
+
+
+        v_template = get_timeseries(neid_dict,'v_template',sample_names)
+        fit_chi = get_timeseries(neid_dict,'chi_template',sample_names)
+        print_string("$v_{CCF}$",CCFRV,mode="2")
+        print_string("$v_{template}$",v_template,mode="2")
+        
+        bulk_offset = np.median(v_template[timestamp<800])-np.median(v_template[timestamp>800])
+        print(f"bulk_offset: {bulk_offset:.2f}m/s")
+        
+        fig,axs = plt.subplots(nrows=2,ncols=3,figsize=(12,6),constrained_layout=True)
+        ax=axs[0][0]
+        ax.scatter(NEID_JD,NEID_CCFRV,c="grey",s=5,label="all (N=%d)"%len(NEID_JD))
+        img = ax.scatter(NEID_JD[SELECT],NEID_CCFRV[SELECT],s=5,label="selected (N=%d)"%len(SELECT))
+        ax.legend(loc="upper left")
+        ax.set_xlabel("JD")
+        ax.set_ylabel("NEID Solar RV [km/s]")
+        ax=axs[0][1]
+        ax.scatter(timestamp,v_template,c='orange',s=3,
+                   label="$v_{template}$ RMS = %.2f m/s"%(v_template.std()))
+        ax.scatter(timestamp,CCFRV,c='grey',s=2,label="$v_{CCF,NEID}$ RMS = %.2f m/s"%(CCFRV.std()))
+
+        ax.legend(title="Discrepancy RMS = %.2f m/s"%(v_template-CCFRV).std())
+        ax.set_xlabel("JD")
+        ax.set_ylabel("RV [m/s]")
+        ax=axs[1][0]
+        ax.scatter(timestamp,fit_chi,c='orange',s=3)
+        ax.set_xlabel("JD")
+        ax.set_ylabel("$\chi^2_r$")
+        ax=axs[1][1]
+        ax.scatter(timestamp,water_vapor,c='b',s=3)
+        ax.set_xlabel("JD")
+        ax.set_ylabel("Water Vapor")
+        ax=axs[0][2]
+        for i in range(100):
+            ax.plot(wave_mean,wave_raw[i]-wave_mean,c='k',lw=1,alpha=0.5)
+        ax.plot(wave_mean,wave_std,c='r',lw=2)
+        ax.set_xlabel("wavelength")
+        ax.set_ylabel("wavelength shifts")
+        
+        plt.tight_layout()
+        plt.savefig(f'./[{datatag}]diagnostic.png',dpi=300)
+        plt.clf()
+        continue
+
+    v_template = get_timeseries(neid_dict,'v_template_processed',sample_names)
+    fit_chi = get_timeseries(neid_dict,'chi_template_processed',sample_names)
+
+    file_batches = neid_dict["info"]["ccf_files"]
+    print("file_batches:",file_batches)
+    # load generated data
+    batch = merge_batch(file_batches)
+    ccf_info,spec_raw,weights,ssbrvs,ids = [item.numpy() for item in batch]
+    #spec_raw[weights<1]=0
+    our_ccf = ccf_info[:,1] - np.mean(ccf_info[:,1])
 
     fig,axs = plt.subplots(ncols=4,nrows=2,figsize=(15,6),constrained_layout=True)
+    plot_sample_selection(axs[1,:], timestamp,v_template,CCFRV,our_ccf,fit_chi,order)
+    axs[1,3].plot(timestamp,water_vapor,".",c="skyblue",label="Water Vapor",zorder=-10)
+    axs[1,3].set_xlabel("JD");axs[1,3].set_ylabel("Water")
 
-    scale = fit_chi.max()/water_vapor.max()
-    axs[1,2].plot(timestamp,scale*water_vapor,".",c="lavender",
-                  label="Water Vapor",zorder=-10)
-    plot_sample_selection(axs[1,:3], timestamp,v_template,v_ccf,fit_chi,order) 
-
-    baseline = neid_dict["info"]["baseline"]
+    baseline = neid_dict["info"]["processed_baseline"]
     baseline_w = neid_dict["info"]["baseline_w"]
     wave_obs = input_wave[i]
 
@@ -960,32 +1903,15 @@ for i,order in enumerate(ORDERS):
     RV_limit = photon_noise(baseline[good],wave_obs[good],sn[good])
     print("Order %d RV_limit: %.2f m/s \n"%(order,RV_limit))
 
-    file_batches = neid_dict["info"]["files"]
 
-    print("file_batches:",file_batches)
-    # load generated data
-    batch = merge_batch(file_batches[:1])
-    wave_raw,spec_raw,weights,ssbrvs,ids = [item.numpy() for item in batch]
+    print_string("$v_{CCF}$",CCFRV,mode="2")
+    print_string("Preview: our $v_{CCF}$",our_ccf,mode="2")
+    print("\n\n")
+    #wave_raw,spec_raw,weights,ssbrvs,ids = [item.numpy() for item in batch]
 
-    n_epoch,N_SPEC = spec_raw.shape
-    fit_chi = fit_chi[:n_epoch]
-    water_vapor = water_vapor[:n_epoch]
-
-    wave_mean = np.median(wave_raw,axis=0)
-    wave_std = np.std(wave_raw,axis=0)
-
-    ax = axs[1,3]
-    for i in range(min(100,n_epoch)):
-        ax.plot(wave_mean,np.abs(wave_raw[i]-wave_mean),"k-",alpha=0.1,zorder=-20)
-    if wave_std.max()>0.01:c="r"
-    else: c="b"
-    ax.plot(wave_mean,wave_std,label="order %d"%order,c=c)
-    ax.legend(ncols=2,loc="upper left")
-    ax.set_xlabel("wavelength")
-    ax.set_ylabel("wavelength dispersion")
-
+    ratio = 20
     rank = np.argsort(water_vapor)[::-1]
-    i_plots = rank[::20]#list(rank[:2])+list(rank[-2:])
+    i_plots = rank[::2000]
     i_plots = i_plots[:5]
 
     cmap = get_cmap('plasma')
@@ -996,7 +1922,7 @@ for i,order in enumerate(ORDERS):
     ax = fig.add_subplot(2, 1, 1)  # Add a new subplot spanning the second row
     for i_obs,obsname in enumerate(sample_names):
         if not i_obs in i_plots:continue
-        ccfrv = v_ccf[i_obs]
+        ccfrv = CCFRV[i_obs]
         yoffset = 0#ccfrv
         date_obs = neid_dict[obsname]['DATE-OBS']
         date = date_obs[5:10]
@@ -1006,7 +1932,10 @@ for i,order in enumerate(ORDERS):
 
         text = "%.2f $v_{CCF}$:%.2f m/s $\chi^2=%.2f$"%(neid_dict[obsname]['timestamp'],ccfrv,fit_chi[i_obs])
         print(text,obsname)
-        ax.plot(wave_raw[i_obs], spec_raw[i_obs],drawstyle="steps-mid",alpha=1.0,lw=1,
+        spec_inflate = ratio*spec_raw[i_obs]+baseline
+        spec_inflate[(weights[i_obs]<1)] = 0
+        spec_inflate[baseline==0] = 0
+        ax.plot(wave_obs,spec_inflate,drawstyle="steps-mid",alpha=1.0,lw=1,
                 c=colors[i_obs],label=text)
         ax.set_xlabel("Raw wavelength ($\AA$)")
         ax.set_ylabel("normalized flux")

@@ -3,6 +3,17 @@ import torch
 from torch import nn
 from torchinterp1d import Interp1d
 from torchcubicspline import natural_cubic_spline_coeffs
+from periodic_spline_model import PeriodicSplineRV
+import torch.nn.functional as F
+
+# Define a 1D Gaussian kernel with standard deviation sigma
+def gaussian_kernel_1d(sigma = 20,kernel_size=51, device=None):
+    # Create 1D Gaussian kernel
+    x = torch.arange(kernel_size) - kernel_size // 2
+    kernel = torch.exp(-0.5 * (x / sigma)**2)
+    kernel = kernel / kernel.sum()  # normalize
+    kernel = kernel.view(1, 1, -1)  # shape: (out_channels, in_channels, kernel_size)
+    return kernel
 
 def cubic_evaluate(coeffs, tnew):
     t = coeffs[0]
@@ -76,8 +87,8 @@ class ParallelMLP(nn.Module):
                  dropout=0,
                  bias=True):
         super(ParallelMLP, self).__init__()
+        self.n_channel=n_channel
         self.mlp = nn.ModuleList([MLP(n_in,n_out,n_hidden=n_hidden,act=act,dropout=dropout,bias=bias) for i in range(n_channel)])
-
 
     def forward(self, x):
         x = [mlp(x[:,i,:])[:,None,:] for i,mlp in enumerate(self.mlp)]
@@ -97,32 +108,16 @@ class ActivityEstimator(nn.Module):
                  n_out=1,
                  n_channel=1,
                  n_hidden=(2,),
-                 planet_params=None,
                  act=(nn.PReLU(), nn.Identity()),
-                 n_planet=15,
                  dropout=0):
         super(ActivityEstimator, self).__init__()
 
         self.mlp = MLP(n_in,n_out,n_hidden=n_hidden,act=act,dropout=dropout)
-        # Initialize additional trainable parameters
-        if planet_params is not None:
-            n_fill = min(n_planet,len(planet_params))
-            init = torch.zeros((n_planet,3))
-            init[:n_fill] = torch.from_numpy(planet_params[:n_fill])
-            self.planet_params = nn.Parameter(init)
 
     def forward(self, x):
         x = self.mlp(x)
         return x
 
-    def doppler_rv(self,t):
-        n_planet,n_param = self.planet_params.shape
-        v_doppler = torch.zeros((n_planet,t.shape[0]),device=t.device)
-        for i in range(n_planet):
-            amp,per,ph = self.planet_params[i]
-            _, v = simulate_planet(t,amp,per,ph)
-            v_doppler[i] = v[:,0]
-        return v_doppler
 
 class SpeculatorActivation(nn.Module):
     """Activation function from the Speculator paper
@@ -298,127 +293,130 @@ class SpectrumEncoder(nn.Module):
     def n_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-# define the order by order sinusoidal fringe model
-class FringeModel(nn.Module):
-    def __init__(self,
-                 instrument,
-                 n_latent=3,
-                 n_knot=80,
-                 n_sin=0,
-                 fringe_length=1.9, # angstrom
-                 fringe_scale=1e-2, # flux value
-                 fringe_phase=torch.pi,
-                ):
+class StablePolynomialBackground(nn.Module):
+    def __init__(self, n_points=7):
+        super().__init__()
+        coeffs = torch.empty(n_points).uniform_(-1, 1)  # small uniform coefficients
+        coeffs -= coeffs.mean()
+        # Use small initial values for stability
+        self.raw_coeffs = nn.Parameter(coeffs)  # start from 0
+        self.coeff_scale = 1e-7  # scale factor to keep coefficients small
 
-        super(FringeModel, self).__init__()
-        if instrument.wave_obs.ndim==2:
-            n_channel,n_spec = instrument.wave_obs.shape
-        else:
-            n_channel=1
-            n_spec = instrument.wave_obs.shape[0]
+    def spline(self, x, values):
+        """
+        Cubic Catmull-Rom spline interpolation
+        x: shape [T], in [0, 1)
+        values: shape [N]
+        """
+        N = values.shape[0]
+        x_scaled = x * N  # [0, N)
+        i = torch.floor(x_scaled).long() % N
+        f = x_scaled - i.float()
 
-        x = instrument.wave_obs
-        x_min,x_max = x.min(),x.max()
-        x_normalized = x - (x_max + x_min)/2
+        def get(idx):
+            j = i + idx
+            j = torch.clamp(j, 0, N - 1)
+            return values[j]
 
-        x_fringe = torch.linspace(x_min,x_max,n_knot)
-        self.n_latent = n_latent
-        self.n_knot = n_knot
-        self.n_sin = n_sin
-        self.L = fringe_length
-        self.scale = fringe_scale
-        self.phi = fringe_phase
-        self.register_buffer('x', x_normalized)
-        self.register_buffer('x_fringe', x_fringe)
-        self.encoder = SpectrumEncoder(instrument, n_latent)
-        self.decoder = MultipleMLP(n_latent,n_knot+n_sin,
-                                   act=(nn.LeakyReLU(), nn.LeakyReLU(), nn.LeakyReLU(), nn.Identity()),
-                                   n_channel=n_channel)#,
-                                   #n_hidden=(),act=(nn.Identity(),))
+        y0 = get(-1)
+        y1 = get(0)
+        y2 = get(1)
+        y3 = get(2)
 
-    def L_k(self, k, x, x_eval, y_knot):
-        L_k = torch.ones((y_knot.size(0), x_eval.size(0)), device=x.device)
-        for i in range(x.size(0)):
-            if i != k:
-                L_k *= (x_eval - x[i]) / (x[k] - x[i])
-        return L_k
+        # Catmull-Rom spline coefficients
+        a = -0.5*y0 + 1.5*y1 - 1.5*y2 + 0.5*y3
+        b = y0 - 2.5*y1 + 2*y2 - 0.5*y3
+        c = -0.5*y0 + 0.5*y2
+        d = y1
 
-    def lagrange_polynomial(self, y_knot):
-        n_order,n_spec = self.x.shape
-        x_knot = torch.linspace(-1,1,self.n_knot,device=y_knot.device)
-        x_eval = torch.linspace(-1,1,n_spec,device=y_knot.device)
-        P_batch = torch.zeros((y_knot.size(0),n_order, n_spec), device=y_knot.device, dtype=torch.float32)
-        for i in range(n_order):
-            for k in range(self.n_knot):
-                L_k = self.L_k(k, x_knot, x_eval, y_knot[:,i,:])
-                P_batch[:,i,:] += y_knot[:,i, k].unsqueeze(1) * L_k
-        return P_batch
-
-    def encode(self, x):
-        return self.encoder(x)
-
-    def decode(self, x):
-        return self.decoder(x)
-
-    def polynomial(self,s):
-        return self.lagrange_polynomial(s)
-
-    def cubic_interpolation(self,y_knot,z):
-        if self.x.ndim==2:
-            n_order,n_spec = self.x.shape
-        else:
-            n_order = 1
-            n_spec = self.x.shape[0]
-        x_knot = torch.linspace(-1,1,self.n_knot,device=y_knot.device)
-        x_eval = torch.linspace(-1,1,n_spec,device=y_knot.device)
-        x_eval = x_eval.repeat(y_knot.size(0),1)
-        spectrum = torch.zeros((y_knot.size(0),n_order, n_spec), device=y_knot.device, dtype=torch.float32)
-        for i in range(n_order):
-            x_shifted = - x_eval * z[:,[i]] + x_eval
-            spectrum[:,i,:] = cubic_transform(x_knot, y_knot[:,i,:], x_shifted)
-        return self.scale*spectrum
+        return ((a * f + b) * f + c) * f + d
 
     def forward(self, x):
-        x = self.encode(x)
-        x = self.decode(x)
-        return x
+        # Normalize x to [-1, 1] along the last dimension
+        x_norm = torch.linspace(0,1,x.shape[0]+1,device=x.device)
+        # Coefficients (shared across batch): shape (D+1,)
+        coeffs = self.coeff_scale * self.raw_coeffs
+        result = self.spline(x_norm[:-1], coeffs)
+        return result  # shape (B, N)
 
 
 class TelluricModel(nn.Module):
     def __init__(self,
                  wave_rest,
+                 spec_rest,
                  instrument,
-                 n_decoder=6,
+                 n_latent=1,
                 ):
 
+
         super(TelluricModel, self).__init__()
-        if instrument.wave_obs.ndim==2:
-            n_channel,n_spec = instrument.wave_obs.shape
-        else:
-            n_channel=1
-            n_spec = instrument.wave_obs.shape[0]
+        n_orders,n_spec = instrument.wave_obs.shape
+        n_sky = n_latent
+        n_star = 3
+        n_continuum = 5
 
-        n_latent = n_decoder
-        self.n_latent = n_latent
-        self.n_decoder = n_decoder
+        self.n_latent = n_sky+n_star+n_continuum+1
+        self.n_sky = n_sky
+        self.n_star = n_star
         self.instrument = instrument
-        self.encoder = SpectrumEncoder(instrument, n_latent)
-        self.decoder = MultipleMLP(n_decoder,n_spec,
-                                   n_channel=n_channel,
-                                   n_hidden=(),
-                                   act=(nn.Identity(),))
-        self.lsf = None
-        self.register_buffer('wave_rest', wave_rest)
-        # initialize weights to avoid large fluctuation
-        for p in self.decoder.parameters():torch.nn.init.normal_(p,std=1e-3)
+        self.encoder = SpectrumEncoder(instrument, self.n_latent)
+        self.sky_decoder = MLP(n_sky,n_spec,n_hidden=(),act=(nn.LeakyReLU(),))
+        self.star_decoder = MLP(n_star,n_spec,n_hidden=(),act=(nn.Identity(),))
+        self.continuum_decoder = MLP(n_continuum,n_spec,n_hidden=(),act=(nn.Identity(),))
 
-    def rectify(self, x):
+        self.lines_act = nn.LeakyReLU()
+        self.instrument_poly = StablePolynomialBackground()
+
+        self.register_buffer('wave_rest', wave_rest)
+        self.register_buffer('broad_kernel', gaussian_kernel_1d(sigma=25,kernel_size=201))
+
+        lsf_kernel = gaussian_kernel_1d(sigma=3,kernel_size=41)
+        self.lsf_kernel = nn.Parameter(lsf_kernel)
+        #self.register_buffer('lsf_kernel', )
+        # internal stellar model!!!
+        self.spec_rest= torch.nn.Parameter(spec_rest.float())
+
+        self.overall_rv_offset = torch.nn.Parameter(torch.rand(1).float()-0.5)
+        self.telluric_rv_offset = torch.nn.Parameter(torch.rand(1).float()-0.5)
+
+        # initialize weights to avoid large fluctuation
+        for p in self.star_decoder.parameters():torch.nn.init.normal_(p,std=1e-3)
+        for p in self.sky_decoder.parameters():torch.nn.init.normal_(p,std=1e-3)
+        for p in self.continuum_decoder.parameters():torch.nn.init.normal_(p,std=1e-3)
+
+    def evaluate_wavelength_polynomial(self,wave_raw,jd):
+        wavelength_shift = torch.zeros_like(wave_raw)
+        spline = self.instrument_poly(wave_raw.mean(dim=0).float())
+        print("spline:",spline.shape)
+        mask = jd.squeeze(1)<800
+        wavelength_shift[mask] += spline
+        return wavelength_shift
+
+    def evaluate_telluric_rv_offset(self,jd):
+        # threshold: jd=800
+        extra_rv = torch.zeros_like(jd)
+        # order of 10 meters per second
+        extra_rv[jd<800] = self.telluric_rv_offset
+        return extra_rv
+
+    def convolve_kernel(self,x,kernel):
+        padding = kernel.shape[-1]//2
+        x = F.conv1d(x, kernel, padding=padding)
         return x
 
+    # rectify solution through high-pass and low-pass filter
+    def rectify(self, x):
+        # high-pass filter
+        y_act = x[:,[0],:]
+        y_slow = self.convolve_kernel(y_act,self.broad_kernel)
+        continuum = self.convolve_kernel(x[:,[1],:],self.broad_kernel)
+        return y_act-y_slow,continuum
+    
     def encode(self, x):
         return self.encoder(x)
-    
+
     def decode(self, x):
+        x = x.reshape((x.shape[0],self.decoder.n_channel,self.n_star))
         x = self.decoder(x)
         x = self.rectify(x)
         return x
@@ -430,10 +428,30 @@ class TelluricModel(nn.Module):
         x = 1.0 - self.transform(x,z,wave)
         return x
 
-    def _forward(self, s, z, wave):
-        x_lines = self.decode(s)
-        x = 1.0 - self.transform(x_lines,z,wave)
-        return x_lines,x
+    def _forward(self, s, z_sky, wave, skymask=None):
+        aux = s[:, -1:]
+
+        # Telluric lines
+        lines = self.sky_decoder(s[:, :self.n_sky]).unsqueeze(1)
+        if skymask is not None: lines[:,:,~skymask] = 0
+        lsf = self.lines_act(self.lsf_kernel)
+        lines = self.convolve_kernel(lines, lsf / lsf.sum())
+
+        # Stellar component
+        y_star = self.star_decoder(s[:, self.n_sky:self.n_sky+self.n_star]).unsqueeze(1)
+        y_star = y_star - self.convolve_kernel(y_star, self.broad_kernel)
+
+        # Continuum
+        continuum = self.continuum_decoder(s[:, self.n_sky+self.n_star:-1]).unsqueeze(1)
+        continuum = self.convolve_kernel(continuum, self.broad_kernel)
+
+        # Construct spectrum
+        x = (1 - lines) * (1 + continuum)
+        x = self.transform(x, z_sky, wave)
+        x *= (self.spec_rest + y_star).squeeze(1)
+        x += 1e-3 * aux
+
+        return lines,continuum,y_star.squeeze(1),x
 
     def transform(self, spectrum_restframe, z, wave):
         n_batch = spectrum_restframe.shape[0]
@@ -448,7 +466,7 @@ class TelluricModel(nn.Module):
         for i in range(n_order):
             wave_redshifted = - wave[i] * z[:,[i]] + wave[i]
             spectrum[:,i,:] = Interp1d()(xx[:,i,:], spectrum_restframe[:,i,:], wave_redshifted)
-        return spectrum
+        return spectrum.squeeze(1)
 
 #### Spectrum decoder ####
 #### Simple MLP but with explicit redshift and instrument path ####
@@ -545,6 +563,7 @@ class BaseAutoencoder(nn.Module):
                  fringe,
                  normalize=False,
                  activity_estimator=None,
+                 doppler_model=None,
                 ):
 
         super(BaseAutoencoder, self).__init__()
@@ -557,6 +576,11 @@ class BaseAutoencoder(nn.Module):
         self.fringe = fringe
         self.normalize = normalize
         self.activity_estimator = activity_estimator
+        self.doppler_model = doppler_model
+        if not decoder.mlp is None:
+            for p in self.decoder.mlp.parameters():
+                torch.nn.init.normal_(p,std=1e-3)
+
 
     def encode(self, x, aux=None):
         return self.encoder(x, aux=aux)
@@ -573,6 +597,9 @@ class BaseAutoencoder(nn.Module):
 
     def estimate_v_act(self,x):
         return self.activity_estimator(x)
+
+    def estimate_doppler_rv(self,x):
+        return self.doppler_model(x)
 
     def _forward(self, s_star, z, instrument=None, aux=None):
         if instrument is None:
@@ -655,7 +682,7 @@ class SpectrumAutoencoder(BaseAutoencoder):
                  n_latent=10,
                  n_telluric=5,
                  n_aux=0,
-                 n_hidden=(64, 256, 1024),
+                 n_hidden=(),#n_hidden=(64, 256, 1024),
                  act=None,
                  normalize=False,
                  skip_encoding=False
@@ -676,10 +703,12 @@ class SpectrumAutoencoder(BaseAutoencoder):
         telluric = None#TelluricModel(wave_rest,instrument,n_decoder=n_telluric)
         fringe = None#FringeModel(instrument)
 
-        activity_estimator = ActivityEstimator(n_latent,planet_params=planet_params)
+        activity_estimator = ActivityEstimator(n_latent)
+        doppler_model = PeriodicSplineRV(planet_params)
 
         if rv_estimator==None:
-            rv_estimator = RVEstimator(instrument.wave_obs.shape,sizes = [20,40])
+            #rv_estimator = NullRVEstimator()
+            rv_estimator = RVEstimator(instrument.wave_obs.shape,sizes = [20,80])
 
         if skip_encoding:
             encoder = None
@@ -693,5 +722,6 @@ class SpectrumAutoencoder(BaseAutoencoder):
             telluric,
             fringe,
             activity_estimator=activity_estimator,
+            doppler_model=doppler_model,
             normalize=normalize,
         )
