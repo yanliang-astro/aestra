@@ -21,7 +21,7 @@ data_dir = "/scratch/gpfs/yanliang"
 
 if "cpu" in sys.argv:device =  torch.device("cpu")
 else:device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-torch.cuda.set_device('cuda:1')
+torch.cuda.set_device('cuda:2')
 
 def tensor2array(tensor):
     if not torch.is_tensor(tensor):return tensor
@@ -198,7 +198,6 @@ def process_spectra(model,instrument,batch,template=None,skymask=None,full=False
     if ssbrv.ndim==1:ssbrv = ssbrv.unsqueeze(1)
     if jd.ndim==1:jd = jd.unsqueeze(1)
 
-
     z_loss = 0
     rv = v_trad + v_planet 
 
@@ -222,21 +221,18 @@ def process_spectra(model,instrument,batch,template=None,skymask=None,full=False
     spectrum_observed = model.decoder.spec_rest+y_act
 
     v_act = model.activity_estimator(s)
-    v_doppler,v_trend = model.estimate_doppler_rv(jd)
+    v_doppler = model.estimate_doppler_rv(jd)
 
     v_doppler = v_doppler.T
     # normalize residual model
     model_resid = spectrum_observed-template
     model_resid[w<1.0] = 0
-    #const = spec_input.mean()-model_resid.mean()
-    #model_resid[w>1.0] += const
+
 
     # compare residual model
     fid_loss = model._loss(spec_zero_rv, w, model_resid, individual=True)
     
     #v_offset = torch.zeros_like(rv)
-    #v_offset[jd<800] = 1.435
-    #v_offset[jd>800] = -1.839
     v_doppler_sum = v_doppler.sum(dim=1)[:,None]
     v_resid = v_apparent-v_offset-v_act-v_doppler_sum
 
@@ -251,7 +247,7 @@ def process_spectra(model,instrument,batch,template=None,skymask=None,full=False
     info = {"ids":jd,"ssbrv":v_ssb,"s":s,#"s_aug":s_aug,
             'v_template': ccf_info[:,[0]],
             'v_ccf': ccf_info[:,[1]],'features':ccf_info[:,2:],
-            "v_apparent":v_apparent,"v_act":v_act,"v_trend":v_trend,
+            "v_apparent":v_apparent,"v_act":v_act,
             "v_doppler":v_doppler,"v_offset":v_offset,
             "loss":fid_loss,"v_planet":v_planet}
 
@@ -268,7 +264,7 @@ def process_spectra(model,instrument,batch,template=None,skymask=None,full=False
 def calculate_v_apparent(model,instrument,batch,template=None,v_planet=0):
 
     ccf_info,spec_raw,w,ssbrv,jd = batch
-    v_trad = ccf_info[:,[1]]
+    v_trad = ccf_info[:,[0]]
 
     template = template_data[1]
     if ssbrv.ndim==1:ssbrv = ssbrv.unsqueeze(1)
@@ -326,6 +322,20 @@ def correct_velocity_offset(aux_file, threshold=800):
     quality = t>0
     return torch.stack([t, v, v_offset, quality])
 
+def save_latents(data,fname):
+    time = data['ids']
+    s = data['s']
+    s_data = np.hstack((time,s))
+    print("s_data:",s_data.shape)
+
+    sort_ind = np.argsort(s_data[:,0])
+    s_data = s_data[sort_ind]
+    s_data = torch.from_numpy(s_data.astype(np.float32)).T
+    latents_path = f"{dynamic_dir}/aux/{fname}_latents.pkl"
+    print("saving to:",latents_path)
+    torch.save(s_data,latents_path)
+    return
+
 #-------------------------------------------------------
 import matplotlib
 dynamic_dir = "/scratch/gpfs/yanliang/neid-production"
@@ -339,7 +349,7 @@ stellar_pattern = r'period(\d+\.\d+)d_K(\d+\.\d+)m_phase(\d+\.\d+)_(\w+).pt'
 basename = os.path.basename(model_file)
 if not "purez" in model_file:
     trim = "_".join(basename.split("_")[:-1])
-    aux_data = correct_velocity_offset(f"{dynamic_dir}/aux/{trim}_v_apparent.pkl")
+    aux_data = correct_velocity_offset(f"{dynamic_dir}/aux/{trim}_v_apparent_full.pkl")
     mode = "fid"
 else: 
     aux_data = torch.zeros((1,4))
@@ -363,7 +373,8 @@ else:
     t0 = 0.0
 
 #dataset_tag = f"{tag}_order{order_value}"
-dataset_tag = f"safe_full"
+#dataset_tag = f"safe_full"
+dataset_tag = f"newprod_full"
 
 print("planet_period,planet_amp,t0:",planet_period,planet_amp,t0 )
 
@@ -409,7 +420,7 @@ tlin = torch.linspace(200,1500,2000,device=instrument.wave_obs.device)[:,None]
 quasi_terms = model.doppler_model.get_quasi_periodic_terms(tlin)
 
 
-batch_size = 100
+batch_size = 20
 for batch_name in files:
     print("batch_name:",batch_name)
     batch = load_batch(batch_name)
@@ -451,6 +462,11 @@ summary['info']['planet_solution'] = tensor2array(model.doppler_model.planet_par
 summary['info']['period_solution'] = tensor2array(model.doppler_model.get_periods())
 
 summary['info']['quasi_terms']= tensor2array(quasi_terms)
+
+if mode =='fid':
+    save_latents(summary['data'],trim)
+
+
 #cluster_labels = k_means_clustering(summary["data"]["s"])
 #summary["data"]["cluster_labels"] = cluster_labels
 

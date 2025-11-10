@@ -10,7 +10,7 @@ class PeriodicSplineRV(nn.Module):
                  n_phi_basis=5,
                  n_trend_basis=10,
                  trend_timescale_days=200,
-                 n_planet=15,
+                 n_planet=12,
                  tmin=200,
                  tmax=1500,
                  share_lengthscales=False):
@@ -23,10 +23,16 @@ class PeriodicSplineRV(nn.Module):
         init = torch.zeros((n_planet,3))
         init[:n_fill] = torch.from_numpy(planet_params[:n_fill,:3])
 
-        planet_params = self.initialize_planets(init[:n_fill])
+        sel = [0,2]
+        #planet_params = self.initialize_planets(init[:n_fill])
+        planet_params = init[:n_fill,sel]
+
         self.planet_params = nn.Parameter(planet_params)
         #self.register_buffer('planet_params',planet_params)
-        self.logperiods = nn.Parameter(torch.log(init[:n_fill,1]))
+        #self.register_buffer('periods',init[:n_fill,1])
+        #self.periods = nn.Parameter(init[:n_fill,1])
+        #self.logperiods = nn.Parameter(torch.log(init[:n_fill,1]))
+        self.register_buffer('logperiods',torch.log(init[:n_fill,1]))
 
         # --- Amplitude modulation params ---
         # Coeffs per component for a small RBF basis over time
@@ -50,18 +56,13 @@ class PeriodicSplineRV(nn.Module):
         self.log_ell_phi = nn.Parameter(torch.log(ph_timescale))
         self.register_buffer('phi_basis_center',torch.linspace(tmin, tmax, n_phi_basis))
 
-
-        #self.trend_coef = nn.Parameter(init_trend_coef)        
-        #self.log_ell_trend = nn.Parameter(torch.log(torch.tensor(trend_timescale_days))) 
-        #self.register_buffer('trend_basis_center',torch.linspace(tmin, tmax, n_trend_basis))
-
-        
         # Optional epoch reference
         self.t0 = nn.Parameter(torch.tensor(0.0), requires_grad=False)
 
 
     def get_periods(self):
         return torch.exp(self.logperiods)
+        #return self.periods
 
 
     def initialize_planets(self, init, n_anchors=5, n_components=5):
@@ -82,12 +83,16 @@ class PeriodicSplineRV(nn.Module):
 
         return anchors
 
-    def doppler_rv(self, t):
+    def sinusoidal_rv(self, t, ph_shift=0, t0=800):
         n_planet,n_param = self.planet_params.shape
+        periods = self.get_periods()
         v_doppler = torch.zeros((n_planet,t.shape[0]),device=t.device)
         for i in range(n_planet):
-            amp,per,ph = self.planet_params[i]
-            _, v = simulate_planet(t,amp,per,ph)
+            amp,phase_t0 = self.planet_params[i]
+            per = periods[i]
+            phase = (((t-t0)/per)+phase_t0+ph_shift)%1
+            #phase = ((t/per)-phase_t0)%1
+            v = amp*torch.sin(2*math.pi*phase)
             v_doppler[i] = v[:,0]
         return v_doppler
 
@@ -165,13 +170,15 @@ class PeriodicSplineRV(nn.Module):
 
             # Carrier from your cubic spline over anchors
             rv_carrier = self.periodic_spline(theta_drift, anchors)  # [T,]
+            # drop obvious activity signals?
+            #if (A_t.max()-A_t.min())>1.0: continue
             # Apply amplitude envelope
             rv_total[i] = A_t * rv_carrier.squeeze()
 
         #ell_trend = torch.exp(self.log_ell_trend)
         #B_trend = self._make_rbf_basis(t,self.trend_basis_center, ell_trend)
         #rv_trend = B_trend @ self.trend_coef
-        return rv_total,torch.zeros_like(t)
+        return rv_total
 
     def spline_rv(self, t):
         """
@@ -218,5 +225,7 @@ class PeriodicSplineRV(nn.Module):
 
         return ((a * f + b) * f + c) * f + d
 
-    def forward(self, t):
-        return self.quasi_periodic_spline_rv(t)
+    def forward(self, t, ph_shift=0):
+        #return self.quasi_periodic_spline_rv(t)
+        #return self.spline_rv(t)
+        return self.sinusoidal_rv(t, ph_shift=ph_shift)

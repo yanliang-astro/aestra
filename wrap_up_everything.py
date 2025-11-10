@@ -25,13 +25,13 @@ from spender_model import TelluricModel
 from util import moving_median,load_batch,merge_batch,load_master_fsr_mask,interpolate_to_input_grid_raw
 from scipy.optimize import curve_fit,minimize
 
-dynamic_dir = "/scratch/gpfs/yanliang/neid-production"
+dynamic_dir = "/scratch/gpfs/JNWINN/yanliang/neid-production"
 #datadir = "/scratch/gpfs/yanliang/NEID-SOLAR"
-datadir = "/scratch/gpfs/yanliang/NEID-DRP1p4"
+datadir = "/scratch/gpfs/JNWINN/yanliang/NEID-DRP1p4"
 runtime_dir = f"{dynamic_dir}/params/"
 device =  torch.device("cpu")
 
-blacklist = [37, 43, 44, 51, 52, 55, 60, 65, 66, 69, 70, 71, 75, 76, 78, 79, 80, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99]
+blacklist = [29,69,70]
 
 colors = ["k",'b','c','m','orange',"gold",'navy',"skyblue"]
 n_colors = len(colors)
@@ -98,14 +98,11 @@ def read_fits(filename,order_value,quality_mask,read_keys=['OBSJD','DATE-OBS','A
     science_flux = hdulist[1].data[order_value][quality_mask]
     science_variance = hdulist[4].data[order_value][quality_mask]
     science_blaze = hdulist[15].data[order_value][quality_mask]
-    telluric_flux = hdulist[10].data[order_value][quality_mask]
 
-    if not header['E_VER']=='v1.3.0':
-        print("\n\nversion:",header['E_VER'],filename)
-        print('\n telluric_flux:',telluric_flux.shape)
-        #print('telluric_header',telluric_header)
-        #exit()
+
     # just the lines, no continuum
+    #telluric_flux = hdulist[10].data[order_value][quality_mask]
+    #print('\n telluric_flux:',telluric_flux.shape)
     #telluric_model = telluric_flux[:,0]#*telluric_flux[:,1]
     telluric_model = np.ones_like(science_flux)
     # Close the FITS file
@@ -144,11 +141,8 @@ def load_model(mainfile, instrument):
 
 def evaluate_sky_model(model,batch,template=None,skymask=None):
     instrument = model.instrument
-    telluric_offset = model.evaluate_telluric_rv_offset(batch[4])
-    print(f"\n Additional Telluric Offset:{telluric_offset.min().item():.3f} m/s, {telluric_offset.max().item():.3f} m/s")
     polyb = model.evaluate_wavelength_polynomial(batch[0],batch[4])
     print(f"\nWavelength shift:{polyb.std(dim=1).max()*instrument.c:.3f} m/s \n")
-
     wave_obs = instrument.wave_obs
 
     # shift to the stellar restframe - frame of wave_obs
@@ -157,7 +151,7 @@ def evaluate_sky_model(model,batch,template=None,skymask=None):
     spec_input[w<1] = 0
 
     wave_raw,spec_raw,w_raw,ssbrv,jd = batch
-    z_sky = (ssbrv+telluric_offset)/instrument.c
+    z_sky = (ssbrv)/instrument.c
     s_sky = model.encode(spec_input)
 
     lines,continuum,y_act,spec_model =  model._forward(s_sky,z_sky,wave_obs,skymask=skymask)
@@ -170,40 +164,48 @@ def evaluate_sky_model(model,batch,template=None,skymask=None):
 
     spec_avg = torch.median(clean_spec,dim=0)[0]
     spec_resid = clean_spec - spec_avg
+    bad = (w<1)|(spec_avg<0.05)|(spec_resid>0.01)
 
-    spec_resid[w<1] = 0
+    spec_resid[bad] = 0
+    clean_spec[bad] = 0
+    w[bad] = 1e-6
+
     w_std = moving_std_weight_batch_torch(spec_resid,w>1)
     w_new = 1/(1/w_std+1/w)
 
     new_batch = [clean_spec, w_new, ssbrv,jd]
     new_batch = [tensor2array(item) for item in new_batch]
-
-    '''
-    new_batch = [tensor2array(item) for item in new_batch]
+    
+    if spec_resid.max()<0.01:    return new_batch
+    print("spec_resid:",spec_resid.min(),spec_resid.max())
+    spec_resid = tensor2array(spec_resid)
+    print("skymask fraction:",skymask.sum()/len(skymask))
+    print("count_zero:",(lines==0).sum()/(lines.shape[0]*lines.shape[-1]))
     wave_raw,spec_raw,w_raw = [tensor2array(item) for item in batch[:3]]
     clean_spec, w_new, ssbrv,jd = new_batch
     wave_obs = tensor2array(wave_obs[0])
     template = tensor2array(template[0])
     spec_input = tensor2array(spec_input)
-    fig,axs = plt.subplots(figsize=(10,4),nrows=2,constrained_layout=True)
+    fig,axs = plt.subplots(figsize=(18,4),nrows=2,constrained_layout=True)
     axs[0].plot(wave_obs,template,'k-',lw=1,alpha=1)
     for i in range(clean_spec.shape[0]):
         count_bad = (w_new[i]<1).sum()
-
-        print("count_bad:",count_bad)
-        print("spec input w:",(w[i]<1).sum())
-        print("w_raw:",(w_raw[i]<1).sum())
+        #print("count_bad:",count_bad)
+        #print("spec input w:",(w[i]<1).sum())
+        #print("w_raw:",(w_raw[i]<1).sum())
         #axs[0].plot(spec_input[i],'k-',lw=1,alpha=1)
         axs[0].plot(wave_raw[i],spec_raw[i],'-',lw=1,alpha=1)
-        axs[1].plot(wave_obs,clean_spec[i],'-',lw=1,alpha=1)
+        axs[1].plot(wave_obs,spec_resid[i],'-',lw=1,alpha=1)
         #break
+    axs[0].set_ylabel("raw flux")
+    axs[1].set_ylabel("telluric corrected")
     #axs[1].plot(wave_obs,clean_spec[where],'r-',lw=1,alpha=1)
-    #for ax in axs:ax.set_ylim(-0.02,0.02);
-    for ax in axs: ax.set_xlim(5035,5040)
+    #for ax in axs:ax.set_ylim(0.86,1.05);
+    #for ax in axs: ax.set_xlim(5670,560)
     plt.savefig("test.png",dpi=200)
     exit()
-    '''
-    return new_batch
+    #'''
+    return
 
 
 def redshift_chi(rv,wave_model,yrest,weight_rest,wave_data,ydata,wdata):
@@ -330,7 +332,7 @@ def save_auxfile(input_data,filename):
     with open(filename, 'wb') as f:
         pickle.dump(input_data, f)
     return
-def make_batch(sample_names,order_value,quality_mask,max_neg_flux=100,max_wave_std=0.0005):
+def make_batch(sample_names,order_value,quality_mask,bulk_offset,max_neg_flux=100,max_wave_std=0.0005):
     large_number = 1e6
     batch_size = len(sample_names)
     n_spec = quality_mask.sum()
@@ -340,7 +342,9 @@ def make_batch(sample_names,order_value,quality_mask,max_neg_flux=100,max_wave_s
     errmat = np.zeros((batch_size,n_spec))
     good =  np.ones((batch_size),dtype=bool)
 
+    shift_z = -bulk_offset[:,None]/Synthetic.c
     local_dict = {}
+
     for i_obs,obsname in enumerate(sample_names):
         data,info_dict = prepare_spectrum_single_order(obsname,quality_mask,order_value)
         wavelength,spectrum,spectrum_err = data
@@ -350,6 +354,7 @@ def make_batch(sample_names,order_value,quality_mask,max_neg_flux=100,max_wave_s
             good[i_obs] = False
             print("negative!!",obsname,neg)
             print("flux: %.2f, %.2f"%(spectrum.min(),spectrum.max()))
+
         #if spectrum.min()<0.01:good[i_obs] = False
         if not good[i_obs]: continue
         local_dict[obsname] = info_dict
@@ -357,17 +362,26 @@ def make_batch(sample_names,order_value,quality_mask,max_neg_flux=100,max_wave_s
         specmat[i_obs] = spectrum
         errmat[i_obs] = spectrum_err
 
+    ccfrv = [local_dict[k]['CCFRV'] for k in local_dict]
+    ccfrv_mean = np.mean(ccfrv)
+    #print("ccfrv:",ccfrv)
+    for i_obs,obsname in enumerate(sample_names):
+        ccfrv_i = local_dict[obsname]['CCFRV']
+        if np.abs(ccfrv_i-ccfrv_mean)>50:
+            good[i_obs] = False
+            print("large CCF RV!!",obsname,(ccfrv_i-ccfrv_mean))
+    
+    wavemat += shift_z*wavemat
     wave_mean = np.mean(wavemat,axis=0,keepdims=True)
     wave_std = (wavemat-wave_mean).std(axis=-1)
-    wh_obs = np.where(wave_std>max_wave_std)
-    for i_obs in np.unique(wh_obs):
+    #wh_obs = np.where(wave_std>max_wave_std)
+    #for i_obs in np.unique(wh_obs):
         #good[i_obs] = False
-        print("unusual wave solution: %d, skip..."%i_obs)
+    #    print("unusual wave solution: %d, skip..."%i_obs)
     print("wave_std:",wave_std.shape)
-    print("where",wh_obs)
 
     bad = errmat**(-2)<1.0
-    print("bad pixels:",(bad.sum()/batch_size))
+    print("bad pixels per spec:",(bad.sum()/batch_size))
     print("good:",good.sum())
     specmat[bad] = 0.0
     wavemat=wavemat[good]
@@ -415,10 +429,11 @@ def velocity_label(velocity,label):
     vlabel = "%s = %s [m/s]"%(label,val)
     return vlabel
 
-def make_batch_worker(batch_id, order_value, quality_mask, batch_name, neid_dict):
-    batch_id,wavemat,specmat,errmat,sub_dict = make_batch(batch_id,order_value,quality_mask)
+def make_batch_worker(batch_id, order_value, quality_mask, batch_name, bulk_offset, neid_dict):
+    batch_id,wavemat,specmat,errmat,sub_dict = make_batch(batch_id,order_value,quality_mask,bulk_offset)
     ssbrvs = get_timeseries(sub_dict,'SSBRV',batch_id).T
     timestamp = get_timeseries(sub_dict,'timestamp',batch_id)
+
     save_batch([wavemat,specmat,errmat**(-2),ssbrvs,timestamp],batch_name)
     print("good spectra: %d"%len(batch_id))
     neid_dict.update(sub_dict)
@@ -440,11 +455,31 @@ def process_task(args, mdict):
         print("mdict:",n_items)
     return
 
-def wrap_data(sample_names,datatag,batch_size,order_value,quality_mask):
+def remove_bulk_offset(datecodes,tref,vref,
+                       utc_cut='20220801',jd_cut=2459797.5):
+    bulk_offset = np.zeros(len(datecodes))
+    ealier = np.array([d < utc_cut for d in datecodes])
+    bulk_offset[ealier] = np.median(vref[tref<jd_cut])
+    bulk_offset[~ealier] = np.median(vref[tref>=jd_cut])
+
+    #plt.plot(tref,vref,'k.')
+    #plt.axhline(bulk_offset.min(),color="b")
+    #plt.axhline(bulk_offset.max(),color="r")
+    #plt.savefig("test.png")
+    return bulk_offset
+
+def wrap_data(sample_names,datatag,diag_tag,batch_size,order_value,quality_mask):
     idx = np.arange(0, len(sample_names), batch_size)
     batches = np.array_split(sample_names, idx[1:])
 
     file_batches = ["%s/%s_%d.pkl"%(dynamic_dir,datatag,k) for k in range(len(batches))]
+
+    with open(f'{runtime_dir}/{diag_tag}-param.pkl',"rb") as f:
+        ref_dict = pickle.load(f)
+
+    sname = ref_dict['info']['sample_names']
+    tref = np.array([ref_dict[k]['OBSJD'] for k in sname])
+    vref = np.array([ref_dict[k]['v_template'] for k in sname])
 
     general_info = {"sample_names":sample_names,
                     "files":file_batches,
@@ -459,9 +494,12 @@ def wrap_data(sample_names,datatag,batch_size,order_value,quality_mask):
         #    print(batch_name,"file exists! continue...")
         #    continue
         batch_id = batches[k]
+        date_code = [item[7:15] for item in batch_id]
+        bulk_offset = remove_bulk_offset(date_code,tref,vref)
+
         print ("saving batch  %d / %d"%(k,len(file_batches)))    
         work_p = mp.Process(target=make_batch_worker,
-                            args=(batch_id, order_value, quality_mask, batch_name, mdict))
+                            args=(batch_id, order_value, quality_mask, batch_name, bulk_offset, mdict))
         process_list.append(work_p)
 
     for i_start in range(0, len(process_list), num_cores):
@@ -697,7 +735,8 @@ def v_template_consistency(datatag,wave_obs):
     template = neid_dict["info"]["processed_baseline"]
     template_w = neid_dict["info"]["baseline_w"]
     order_value = neid_dict["info"]["order"]
-
+    
+    
     processed = []
     for k,batch_name in enumerate(file_batches[:1]):
         basename = os.path.basename(batch_name).rsplit('.', 1)[0]
@@ -705,7 +744,7 @@ def v_template_consistency(datatag,wave_obs):
         processed.append(fname)
     print("processed:",processed)
 
-    batch = merge_batch(processed)
+    batch = merge_batch(processed[:1])
     _,specs,weights,ssbrvs,ids = [item.numpy() for item in batch]
 
     v_extra = np.linspace(-50,50,len(specs))
@@ -759,46 +798,52 @@ def multiple_order_v_template(tag,suffix):
     with open(params_file,"rb") as f:
         neid_dict = pickle.load(f)
     sample_names = neid_dict["info"]["sample_names"]
-    print(neid_dict['info']['files'])
+    #print(neid_dict['info']['files'])
     # calculate v_template and chi_template
     file_batches = neid_dict["info"]["files"]
     wave_obs = neid_dict["info"]["wave_obs"][0]
     template = neid_dict["info"]["baseline"]
     template_w = neid_dict["info"]["baseline_w"]
     order_value = neid_dict["info"]["order"]
-    #print("wave_obs:",wave_obs.shape,"template:",template.shape)
 
-    batch = merge_batch(file_batches)
-    _,specs,weights,ssbrvs,ids = [item.numpy() for item in batch]
+    start = 0
+    for j,file in enumerate(file_batches):
+        basename = os.path.basename(file)
+        merge_file = f"{dynamic_dir}/merge/{basename}"
+        batch = merge_batch([merge_file])
+        _,specs,weights,ssbrvs,ids = [item.numpy() for item in batch]
 
-    manager = mp.Manager()
-    mdict = manager.dict()
-    # Use a pool of workers
-    pool_size = num_cores  # Number of processes in the pool
-    pool = mp.Pool(pool_size)
-    tasks = []
-    for i_epoch,obsname in enumerate(sample_names):
-        #if not obsname=="neidL2_20230603T183210.fits":continue
-        # skip existing entries
-        #if 'v_template' in neid_dict[obsname]:continue
-        # already in stellar restframe
-        task_args = (wave_obs, specs[i_epoch], weights[i_epoch], wave_obs,template,template_w, obsname, order_value)
-        tasks.append(task_args)
+        manager = mp.Manager()
+        mdict = manager.dict()
+        # Use a pool of workers
+        pool_size = num_cores  # Number of processes in the pool
+        pool = mp.Pool(pool_size)
+        tasks = []
 
-    for i,task in enumerate(tasks):
-        pool.apply_async(process_task, args=(task, mdict))
-    # Close and join the pool
-    pool.close()
-    pool.join()
+        end = start + len(ids)
+        for iloc,i_epoch in enumerate(np.arange(start,end)):
+            obsname = sample_names[i_epoch]
+            # skip existing entries
+            if 'v_template' in neid_dict[obsname]:continue
+            # already in stellar restframe
+            task_args = (wave_obs, specs[iloc], weights[iloc], wave_obs,template,template_w, obsname, order_value)
+            tasks.append(task_args)
+        start = end
 
-    print("mdict:",mdict)
-    for k in sample_names:
-        if k in mdict:neid_dict[k].update(mdict[k])
-        else:print("%s missing..."%k)
+        for i,task in enumerate(tasks):
+            pool.apply_async(process_task, args=(task, mdict))
+        # Close and join the pool
+        pool.close()
+        pool.join()
 
-    print(f"Saving to {params_file}...")
-    with open(params_file,"wb") as f:
-        pickle.dump(neid_dict,f)
+        print(j,"mdict:",mdict)
+        for k in sample_names:
+            if k in mdict:neid_dict[k].update(mdict[k])
+            #else:print("%s missing..."%k)
+
+        print(f"Saving to {params_file}...")
+        with open(params_file,"wb") as f:
+            pickle.dump(neid_dict,f)
     return 
 
 def multiple_order_v_template_consistency(tag,suffix):
@@ -808,17 +853,38 @@ def multiple_order_v_template_consistency(tag,suffix):
         neid_dict = pickle.load(f)
     sample_names = neid_dict["info"]["sample_names"]
     print(neid_dict['info']['files'])
+    print("sample_names:",len(sample_names))
     # calculate v_template and chi_template
     file_batches = neid_dict["info"]["files"]
     wave_obs = neid_dict["info"]["wave_obs"][0]
     template = neid_dict["info"]["baseline"]
     template_w = neid_dict["info"]["baseline_w"]
     order_value = neid_dict["info"]["order"]
+
+    ccf_files = []
+    for k,batch_name in enumerate(file_batches):
+        print("Loading %s..."%batch_name)
+        datatag = os.path.basename(batch_name).rsplit('.', 1)[0]
+        ccf_files.append(f"{dynamic_dir}/ccf_info/{datatag}.pkl")
+
+    print("file_batches:",ccf_files)
     #print("wave_obs:",wave_obs.shape,"template:",template.shape)
 
-    batch = merge_batch(file_batches[:1])
-    _,specs,weights,ssbrvs,ids = [item[:10].numpy() for item in batch]
+    batch = merge_batch(ccf_files[:1])
+    ccf_info,specs,weights,ssbrvs,ids = [item.numpy() for item in batch]
 
+    print("ccf_info:",ccf_info.shape)
+    v_template = ccf_info[:,0]
+    v_ccf = ccf_info[:,1]
+    times = ids
+
+    fig,ax=plt.subplots(figsize=(8,3),constrained_layout=True)
+    ax.plot(times,v_ccf,'k.',label=f"v_ccf RMS = {v_ccf.std():.3f}")
+    ax.plot(times,v_template,'r.',label=f"v_template RMS = {v_template.std():.3f}")
+    ax.legend()
+    plt.savefig("test.png",dpi=200)
+    exit()
+    
     v_extra = np.linspace(-10,10,len(specs))
     v_extra = v_extra
 
@@ -841,7 +907,7 @@ def multiple_order_v_template_consistency(tag,suffix):
 
     quantile = np.quantile(v_ref,[0.16,0.84])
     print("quantile:",quantile)
-    print(f"v_ccf rms: {0.5*(quantile[1]-quantile[0]):.3f} m/s")
+    print(f"v_ref rms: {0.5*(quantile[1]-quantile[0]):.3f} m/s")
     v_resid = v_inject-v_ref-v_extra
     print(f"v_difference rms: {v_resid.std():.3e} m/s")
     print(f"chi : {chi_ref.mean():.3f}")
@@ -987,7 +1053,7 @@ def preview_spectrum(ax,obsname,order_value,quality_mask):
     print(spec_telluric.shape)
 
     #telluric = info_dict['telluric_model']
-    ylim=[0,max(1.2,spectrum.max())]
+    ylim=[0.8,max(1.05,spectrum.max())]
 
     ax.set_title("Order %d"%order_value)
     ax.plot(wavelength,spectrum,"k-",lw=1,label="corrected",drawstyle="steps-mid")
@@ -998,6 +1064,7 @@ def preview_spectrum(ax,obsname,order_value,quality_mask):
                     spectrum+spectrum_err,step="mid",
                     color="k",alpha=0.3,zorder=-10)
     ax.legend(loc=3)
+    ax.set_xlim(wavelength[0],wavelength[-1])
     ax.set_ylim(ylim)
     return
 
@@ -1008,22 +1075,6 @@ def initialize_restframe_model(wave_obs,template,weight):
     init_rest = np.array([wave_rest,spec_rest])
     print("init_rest:",init_rest.shape)
     return init_rest
-
-def plot_skymask(input_wave,y_sky,dispersion,wavemean,skymask):
-    fig, axs = plt.subplots(figsize=(12,8),nrows=n_order,constrained_layout=True)
-    for o in range(n_order):
-        ax=axs[o]
-        for i in range(20):
-            ax.plot(input_wave[o],1-y_sky[i][o],"k-",alpha=0.3,lw=1)
-        ax.plot(input_wave[o],1-dispersion[o],"r-")
-        for line in lines:
-            ax.axvline(x=line[0],ymin=0,ymax=1.2,ls="--",color="b")
-        ax.fill_between(wavemean[o],0,1.1,where=skymask[o],color="b",alpha=0.3)
-        where=input_wave[o][2000]
-        ax.set_ylim(0.9,1.01)
-        ax.set_xlim(where-10,where+10)
-    plt.savefig("skymask.png",dpi=200)
-    return
 
 def print_string(vname,v,mode="1"):
     if mode=="1":
@@ -1200,71 +1251,6 @@ def continuum_worker(batch_name,save_name,template):
     save_batch([np.zeros_like(jd),spec_input,w,ssbrv,jd],save_name)
     return
 
-def correct_for_continuum(datatag,instrument,template_data):
-    print(f'Loading from {runtime_dir}{datatag}-param.pkl')
-    with open(f'{runtime_dir}{datatag}-param.pkl',"rb") as f:
-        neid_dict = pickle.load(f)
-    file_batches = neid_dict["info"]["files"]
-    template = neid_dict["info"]["baseline"]
-    wave_obs = tensor2array(template_data[0])[0]
-    print("wave_obs:",wave_obs.shape)
-    print("file_batches:",file_batches)
-
-    process_list = []
-    manager = mp.Manager()
-    mdict = manager.dict()
-    for k,batch_name in enumerate(file_batches):
-        print("Loading %s..."%batch_name)
-        datatag = os.path.basename(batch_name).rsplit('.', 1)[0]
-        save_name = f"{dynamic_dir}/processed/{datatag}.pkl"
-        #continuum_worker(batch_name,save_name,template)
-        print ("saving batch  %d / %d"%(k,len(file_batches)))    
-        work_p = mp.Process(target=continuum_worker,
-                            args=(batch_name,save_name,template))
-        process_list.append(work_p)
-
-    print("process_list",process_list)
-    for i_start in range(0, len(process_list), num_cores):
-        print("[continuum]Currently running #%i - #%i"%(i_start, min(i_start+num_cores,len(process_list))))
-        running_list = process_list[i_start:i_start+num_cores]
-        [p.start() for p in running_list]
-        [p.join()  for p in running_list]
-    return
-
-def correct_for_bulk_offset(datatag):
-    print(f'Loading from {runtime_dir}{datatag}-param.pkl')
-    with open(f'{runtime_dir}{datatag}-param.pkl',"rb") as f:
-        neid_dict = pickle.load(f)
-    file_batches = neid_dict["info"]["files"]
-    sample_names = neid_dict["info"]["sample_names"]
-    timestamp = get_timeseries(neid_dict,'timestamp',sample_names)
-    v_template = get_timeseries(neid_dict,'v_template',sample_names)
-    t_segments = [[0,800],[800,1600]]
-    bulk_velocity = []
-    for seg in t_segments: 
-        mask = (timestamp>=seg[0])&(timestamp<seg[1])
-        bulk_velocity.append(np.median(v_template[mask]))
-    print("bulk_velocity:",bulk_velocity)
-    print("file_batches:",file_batches)
-
-    for k,batch_name in enumerate(file_batches):
-        print("Loading %s..."%batch_name)
-        datatag = os.path.basename(batch_name).rsplit('.', 1)[0]
-        save_name = f"{dynamic_dir}/bulk_velocity/{datatag}.pkl"
-        #continuum_worker(batch_name,save_name,template)
-        print ("saving batch  %d / %d"%(k,len(file_batches)))
-        wave_raw,spec_raw,w,ssbrv,jd = load_batch(batch_name)
-        v_bulk = torch.zeros_like(ssbrv)
-        for i,seg in enumerate(t_segments): 
-            mask = (jd>=seg[0])&(jd<seg[1])
-            v_bulk[mask] = bulk_velocity[i]
-        z_bulk = v_bulk/Synthetic.c
-        wave_shifted = wave_raw*(1-z_bulk)
-
-        print("saving to %s..."%save_name)
-        with open(save_name, 'wb') as f:
-            pickle.dump([wave_shifted,spec_raw,w,ssbrv,jd], f)
-    return
 
 def correct_for_telluric_lines(datatag,instrument,template_data,skymodel,skymask):
     print("\n\n Correcting for telluric lines and continuum...")
@@ -1289,10 +1275,7 @@ def correct_for_telluric_lines(datatag,instrument,template_data,skymodel,skymask
         save_batch([np.zeros_like(jd),spectra,w,ssbrv,jd],save_name)
     return
 
-def merge_multiple_orders(tag,ORDERS,suffix,sample_names,batch_size):
-    idx = np.arange(0, len(sample_names), batch_size)
-    batches = np.array_split(sample_names, idx[1:])
-    
+def merge_multiple_orders(outtag,ORDERS,suffix,sample_names,batch_size,tag="newprod"):
     templates = []
     skymasks = []
     merge_dict = {}
@@ -1300,9 +1283,16 @@ def merge_multiple_orders(tag,ORDERS,suffix,sample_names,batch_size):
     info_keys = ['OBSJD','DATE-OBS','AIRMASS','WVAPOR','E_VER','ZENITH',
                  'CCFRVMOD','DVRMSMOD','timestamp']
 
-    merge_dict['info'] = {'sample_names':sample_names,"order":ORDERS}
 
+    idx = np.arange(0, len(sample_names), batch_size)
+    batches = np.array_split(sample_names, idx[1:])
+    order_dict = {}
+    print("batches:",len(batches))
+
+    intersect_mask = np.array([True]*len(sample_names))
+    
     for i,order in enumerate(ORDERS):
+        order_dict[order] = {}
         datatag = f"{tag}_order{order}_{suffix}"
         template_name = f"{dynamic_dir}/{datatag}-template.pkl"
         skymask_file = f"{dynamic_dir}/skymask/{datatag}-skymask.pkl"
@@ -1311,58 +1301,95 @@ def merge_multiple_orders(tag,ORDERS,suffix,sample_names,batch_size):
         print(f'Loading from {params_file}')
         with open(params_file,"rb") as f:
             neid_dict = pickle.load(f)
-        for obsname in neid_dict:
-            if obsname=='info':continue
-            select = {key:neid_dict[obsname][key] for key in info_keys}
-            if not obsname in merge_dict:merge_dict[obsname] = select
+
+        samples_i = neid_dict['info']['sample_names']
+        mask_i = np.isin(sample_names,samples_i,assume_unique=True)
+        intersect_mask &= mask_i
+        print("order:",order,"samples:",len(samples_i),
+              "intersect_mask",intersect_mask.sum())
+        order_dict[order]['samples_i'] = samples_i
 
         template_data = load_batch(template_name)
         template_data = [item.to(device=device) for item in template_data]
         templates.append(template_data)
         skymasks.append(load_batch(skymask_file).bool())
 
+        for obsname in sample_names:
+            if not obsname in neid_dict:continue
+            select = {key:neid_dict[obsname][key] for key in info_keys}
+            if not obsname in merge_dict:merge_dict[obsname] = select
+
+    intersect_names = np.array(sample_names)[intersect_mask]
+    merge_dict['info'] = {'sample_names':intersect_names,"order":ORDERS}
+
+    #'''
+    for k in range(len(batches)):
+        k_names = batches[k]
+        for o in ORDERS:
+            in_order = np.isin(k_names,order_dict[o]['samples_i'])
+            order_k_mask = np.isin(k_names[in_order],intersect_names)
+            order_dict[o][k] = order_k_mask
+            print(f"batch {k} order {o} mask shape: {order_k_mask.shape} mask sum: {order_k_mask.sum()}")
+    #'''
+    # update spectral template
+    combined_wave_obs = torch.cat([item[0] for item in templates],dim=1)
+    print("combined_wave_obs:",combined_wave_obs.shape)
+    combined_wave_obs = tensor2array(combined_wave_obs)
+
+    wavelist = [tensor2array(item[0]) for item in templates]
+    wavemasks = [
+        (w < np.min(wavelist[i+1])) if i < len(wavelist)-1 else np.ones_like(w, bool) 
+        for i, w in enumerate(wavelist)
+    ]
+
+    wavemasks = np.concatenate(wavemasks,axis=1)[0]
+    combined_wave_obs = combined_wave_obs[:,wavemasks]
+    print("combined_wave_obs",combined_wave_obs.shape)
+
+
     filenames = []
     for k in range(len(batches)):
-        save_name = f"{dynamic_dir}/merge/{tag}_{suffix}_{k}.pkl"
+        save_name = f"{dynamic_dir}/merge/{outtag}_{suffix}_{k}.pkl"
         filenames.append(save_name)
         if os.path.isfile(save_name):
             print(f"{save_name} already exists...")
             continue
         combined_spectra = []
         combined_w = []
+        combined_jd = []
         for i,order in enumerate(ORDERS):
             datatag = f"{tag}_order{order}_{suffix}"
             batch_name = f"{dynamic_dir}/{datatag}_{k}.pkl"
-            skymodel_file = f"skymodel/poly_order{order}_full.pt"
+            skymodel_file = f"skymodel/blue_order{order}_full.pt"
 
             print("batch_name:",batch_name)
-            print("template_name:",template_name)
-
             wave_obs,template = templates[i][:2]
             instrument = Synthetic(wave_obs)
 
             skymodel,losses = load_model(skymodel_file,instrument)
             batch = load_batch(batch_name)
             batch = [item.to(device=device) for item in batch]
-            print("batch_name:",batch_name,)
-            spectra, w, ssbrv, jd = evaluate_sky_model(skymodel,batch,template,skymasks[i])
-            print("spectra:",spectra.shape,"w:",w.shape,"jd:",jd.shape)
+
+            out_batch = evaluate_sky_model(skymodel,batch,template,skymasks[i])
+            mask_ok = order_dict[order][k]
+            spectra, w, ssbrv, jd = [item[mask_ok] for item in out_batch]
+
             combined_spectra.append(spectra)
             combined_w.append(w)
+            combined_jd.append(jd)
+
         combined_spectra = np.concatenate(combined_spectra,axis=1)
         combined_w = np.concatenate(combined_w,axis=1)
+        combined_spectra = combined_spectra[:,wavemasks]
+        combined_w = combined_w[:,wavemasks]
         print("combined_spectra:",combined_spectra.shape,
               "combined_w:",combined_w.shape,"jd:",jd.shape)
         print(f"saving to {save_name}...")
         save_batch([np.zeros_like(jd),combined_spectra,combined_w,ssbrv,jd],save_name)
 
-    # update spectral template
-    combined_wave_obs = torch.cat([item[0] for item in templates],dim=1)
-    print("combined_wave_obs:",combined_wave_obs.shape)
-    combined_wave_obs = tensor2array(combined_wave_obs)
-    
+
     print("filenames:",filenames)
-    batch = merge_batch(filenames)
+    batch = merge_batch(filenames[:1])
     _,spectrum,weights,ssbrvs,ids = [item.numpy() for item in batch]
     print("spectrum:",spectrum.shape)
 
@@ -1380,29 +1407,31 @@ def merge_multiple_orders(tag,ORDERS,suffix,sample_names,batch_size):
         template_w[i] = np.median(w[good])
         dispersion[i] = np.std(flux[good])
 
+    
     merge_dict['info']['files'] = filenames
     merge_dict['info']['wave_obs'] = combined_wave_obs
     merge_dict['info']['baseline'] = template
     merge_dict['info']['baseline_w'] = template_w
 
-    params_file = f'{runtime_dir}{tag}_{suffix}-param.pkl'
+    params_file = f'{runtime_dir}{outtag}_{suffix}-param.pkl'
     print(f"Saving to {params_file}...")
     with open(params_file,"wb") as f:
         pickle.dump(merge_dict,f)
 
-    template_name=f"{dynamic_dir}/merge/{datatag}-template.pkl"
+    template_name=f"{dynamic_dir}/merge/{outtag}_{suffix}-template.pkl"
     save_batch([combined_wave_obs,template[None,:],template_w[None,:],
                 np.array([0]),np.array([888])],template_name)
     #'''
     fig,ax=plt.subplots(figsize=(16,3),constrained_layout=True)
     for i in range(50):
         mask = spectrum[i]>0
-        ax.plot(combined_wave_obs[0][mask],spectrum[i][mask],"k-",lw=1,alpha=0.1,drawstyle="steps-mid")
+        ax.plot(combined_wave_obs[0][mask],spectrum[i][mask],"k-",lw=1,alpha=0.1)
     ax.plot(combined_wave_obs[0],template,"r-",lw=1,drawstyle="steps-mid",label="template")
+    #ax.plot(combined_wave_obs[0],template_w/template_w.max(),"b-",lw=0.5,drawstyle="steps-mid",label="weights")
     ax.plot(combined_wave_obs[0],100*dispersion,"c-",lw=1,drawstyle="steps-mid",label="100xdispersion")
-    ax.legend()
-    #ax.set_xlim(wave_obs[300]-2,wave_obs[300]+2)
-    plt.savefig("[%s]template.png"%datatag,dpi=200)
+    ax.legend(loc="lower right")
+    #ax.set_xlim(5452.5,5460)
+    plt.savefig("[%s]template.png"%outtag,dpi=200)
     #'''
     return
 
@@ -1564,6 +1593,7 @@ def ccf_worker(batch_name,save_name,wave_obs,template,timetable):
     ccf_matrix, velocity_grid = compute_ccf(spectra, w, wave_obs, 1-template)
     params,v_ccf,bisspan = compute_bisspan(velocity_grid,ccf_matrix)
     print(f"v_ccf RMS:{v_ccf[:,0].std():.3f} m/s  chi:{v_ccf[:,1].mean():.2f}")
+    #v_template = np.zeros_like(v_ccf[:,0])
     print(f"v_template RMS:{v_template.std():.3f} m/s ")
     print(f"Difference RMS:{(v_template-v_ccf[:,0]).std():.3f} m/s ")
 
@@ -1588,8 +1618,7 @@ def add_ccf_trad_indicators(datatag):
     with open(params_file,"rb") as f:
         neid_dict = pickle.load(f)
     file_batches = neid_dict["info"]["files"]
-    try:template = neid_dict["info"]['processed_baseline']
-    except: template = neid_dict["info"]['baseline']
+    template = neid_dict["info"]['baseline']
 
     print("keys:",neid_dict["info"].keys())
     wave_obs = neid_dict["info"]["wave_obs"][0]
@@ -1618,16 +1647,20 @@ def add_ccf_trad_indicators(datatag):
         save_name = f"{dynamic_dir}/ccf_info/{datatag}.pkl"
 
         ccf_files.append(save_name)
+        if os.path.isfile(save_name): 
+            print(save_name,"file exists")
+            continue
         print ("saving batch  %d / %d"%(k,len(file_batches))) 
         work_p = mp.Process(target=ccf_worker,
                             args=(load_name,save_name,wave_obs,template,timetable))
         process_list.append(work_p)
 
-    #neid_dict["info"]["ccf_files"] = ccf_files
-    #print(f"Saving to {params_file}...")
-    #with open(params_file,"wb") as f:
-    #    pickle.dump(neid_dict,f)
+    neid_dict["info"]["ccf_files"] = ccf_files
+    print(f"Saving to {params_file}...")
+    with open(params_file,"wb") as f:
+        pickle.dump(neid_dict,f)
 
+    num_cores = 10
     print("process_list",process_list)
     for i_start in range(0, len(process_list), num_cores):
         print("[ccf]Currently running #%i - #%i"%(i_start, min(i_start+num_cores,len(process_list))))
@@ -1699,16 +1732,18 @@ batch_size = args.batch_size
 num_cores = args.num_cores
 load_data = args.load_data
 
-#ORDERS = [30,40,50,53,54,56,57,58]
-#ORDERS = [int(o) for o in args.orders]
+
+
 #ORDERS = np.arange(65,100)
 #ORDERS = np.arange(41,100)
-#ORDERS = np.arange(45,55)
-#ORDERS = [i for i in ORDERS if not i in blacklist]
-#ORDERS = [50,51,52,53,54]
-#ORDERS = [59,60,61,62,63,64,65,66,67]
+ORDERS = np.arange(31,75)
+ORDERS = [i for i in ORDERS if not i in blacklist]
 
-ORDERS = [56]
+#ORDERS = np.arange(31,33) # test
+#ORDERS = np.arange(49,56) # safe
+#ORDERS = np.arange(45,49)# safeblue
+#ORDERS = np.arange(31,36)# extremblue
+
 print("ORDERS:",ORDERS)
 print(" ".join([str(i) for i in ORDERS[1::2]]))
 
@@ -1720,9 +1755,9 @@ input_wave = [get_order_wavelengths(o) for o in ORDERS]
 for i,order in enumerate(ORDERS):
     print("order %d: wave_obs: %d, quality_mask:%d"%(order,len(input_wave[i]),quality_mask[order].sum()))
 
-file_path = "/scratch/gpfs/yanliang/headers/NEID_QUIET_OBSNAME.txt"
+file_path = "NEID_HIGH_QUALITY_OBSNAME.txt"
 # Load the data from the text file
-data = np.loadtxt(file_path, dtype={'names': ('filename', 'jd', 'ccfrv'), 'formats': ('S30', 'f8', 'f8')})
+data = np.loadtxt(file_path, dtype={'names': ('filename', 'jd', 'ccfrv'), 'formats': ('S53', 'f8', 'f8')})
 
 if args.when =="a":
     suffix = "after"
@@ -1733,18 +1768,21 @@ elif args.when =="b":
     goodmask = (data['jd']<2459800.0)
 elif args.when =="full":
     suffix = "full"
-    goodmask = (data['jd']>0.0)
+    goodmask = (data['jd']<2460600.0)
 else:
     print("invalid argument %s"%args.when)
     exit()
+
 # Extract columns into separate arrays
 NEID_JD = data['jd'][goodmask]
-NEID_FILENAMES = np.array([x.decode('utf-8') for x in data['filename'][goodmask]])
+NEID_FILENAMES = np.array([os.path.basename(x.decode('utf-8')) for x in data['filename'][goodmask]])
 NEID_CCFRV = data['ccfrv'][goodmask]
 
 existing_files = os.listdir(datadir)
 print("existing files:",len(existing_files))
 print("qualified files:",len(NEID_FILENAMES))
+print("NEID_FILENAMES:",NEID_FILENAMES[:5])
+
 
 # Find the indices of available_names in full_names
 sel = np.nonzero(np.in1d(NEID_FILENAMES, existing_files))[0]
@@ -1753,22 +1791,21 @@ np.random.shuffle(sel)
 SELECT = sel[:n_sample]
 raw_sample_names = list(NEID_FILENAMES[SELECT])
 print("Selected samples:",len(raw_sample_names))
-print("raw_sample_names:",raw_sample_names)
-#np.savetxt("test_sample_names_100.txt",raw_sample_names, fmt="%s")
-#exit()
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+device = torch.device('cuda:2' if torch.cuda.is_available() else 'cpu')
 #merge_multiple_orders(tag,ORDERS,suffix,raw_sample_names,batch_size)
-#multiple_order_v_template(tag,suffix)
+multiple_order_v_template(tag,suffix)
 #add_ccf_trad_indicators(f"{tag}_{suffix}")
 #multiple_order_v_template_consistency(tag,suffix)
 
-#exit()
+exit()
 '''
 fig, axs = plt.subplots(figsize=(15,2*n_order),nrows=n_order,dpi=200,constrained_layout=True)
 for i,order in enumerate(ORDERS):
-    preview_spectrum(axs[i],'neidL2_20220420T201416.fits',
+    preview_spectrum(axs[i],'neidL2_20210710T210857.fits',
                      order,quality_mask=quality_mask[order])
     plt.savefig("[%s]single-obs.png"%tag)
+exit()
 '''
 
 #torch.cuda.set_device('cuda:1')
@@ -1776,31 +1813,14 @@ for i,order in enumerate(ORDERS):
 
 for i,order in enumerate(ORDERS):    
     datatag = "%s_order%d_%s"%(tag,order,suffix)
+    diag_tag = "test_order%d_%s"%(order,suffix)
     if not load_data:
         print("wrapping order:",order)
-        wrap_data(raw_sample_names,datatag,batch_size,order,quality_mask[order])
+        wrap_data(raw_sample_names,datatag,diag_tag,batch_size,order,quality_mask[order])
         calculate_template_spectrum(datatag,input_wave[i])
+        # skip v_template calculation
+        continue
         calculate_v_template(datatag,input_wave[i])
-        template_data = load_batch("%s/%s-template.pkl"%(dynamic_dir,datatag))
-        template_data = [item.to(device=device) for item in template_data]
-
-        wave_obs = template_data[0]
-        instrument = Synthetic(wave_obs)
-
-        '''
-        model_file = f"skymodel/poly_order{order}_full.pt"
-        skymask = load_batch("%s/skymask/%s-skymask.pkl"%(dynamic_dir,datatag)).bool()
-        skymodel,losses = load_model(model_file,instrument)
-        correct_for_telluric_lines(datatag,instrument,template_data,
-                                   skymodel,skymask)
-        update_template_spectrum(datatag,input_wave[i])
-        update_v_template(datatag,input_wave[i])
-        v_template_consistency(datatag,input_wave[i])
-        add_ccf_trad_indicators(datatag,instrument,input_wave[i])
-        '''
-        #exit()
-        #daily_average_spectrum(datatag)
-    #else: calculate_v_template(datatag,input_wave[i])
 
     print("Loading from %s-param.pkl"%datatag)
     with open(f'{runtime_dir}/{datatag}-param.pkl',"rb") as f:
@@ -1809,8 +1829,8 @@ for i,order in enumerate(ORDERS):
     timestamp = get_timeseries(neid_dict,'timestamp',sample_names)
     jds = get_timeseries(neid_dict,'OBSJD',sample_names)
     #print("info",neid_dict["data"].keys())
-
-
+    print("jds:",jds.max())
+    
     SSBRV = get_timeseries(neid_dict,'SSBRV',sample_names)
     CCFRV = get_timeseries(neid_dict,'CCFRV',sample_names)
     water_vapor = get_timeseries(neid_dict,'WVAPOR',sample_names)
@@ -1825,9 +1845,13 @@ for i,order in enumerate(ORDERS):
         file_batches = neid_dict["info"]["files"]
         print("file_batches:",file_batches)
         # load generated data
-        batch = merge_batch(file_batches[:3])
+        batch = merge_batch(file_batches)
         wave_raw,spec_raw,weights,ssbrvs,ids = [item.numpy() for item in batch]
-
+        
+        print("wave_raw nan:",np.isnan(wave_raw).sum())
+        print("spec_raw nan:",np.isnan(spec_raw).sum())
+        print("weights nan:",np.isnan(weights).sum())
+        exit()
         wave_mean = np.mean(wave_raw,axis=0,keepdims=True)
         wave_std = (wave_raw-wave_mean).std(axis=0)
         wave_mean = wave_mean[0]
@@ -1835,20 +1859,50 @@ for i,order in enumerate(ORDERS):
 
         v_template = get_timeseries(neid_dict,'v_template',sample_names)
         fit_chi = get_timeseries(neid_dict,'chi_template',sample_names)
+
         print_string("$v_{CCF}$",CCFRV,mode="2")
         print_string("$v_{template}$",v_template,mode="2")
         
-        bulk_offset = np.median(v_template[timestamp<800])-np.median(v_template[timestamp>800])
-        print(f"bulk_offset: {bulk_offset:.2f}m/s")
+        #bulk_offset = np.median(v_template[timestamp<800])-np.median(v_template[timestamp>800])
+        #print(f"bulk_offset: {bulk_offset:.2f}m/s")
         
-        fig,axs = plt.subplots(nrows=2,ncols=3,figsize=(12,6),constrained_layout=True)
-        ax=axs[0][0]
+        fig,axs = plt.subplots(nrows=2,ncols=4,figsize=(15,6),constrained_layout=True)
+        for ax in axs[0, :]:fig.delaxes(ax)
+        ax = fig.add_subplot(2, 1, 1) 
+        cdata = fit_chi
+        rank = np.argsort(cdata)[::-1]
+        i_plots = rank[::(len(rank)//7)]
+        cmap = get_cmap('plasma')
+        cmin,cmax = min(cdata),max(cdata)
+        colors =[cmap((ii-cmin)/(cmax-cmin)) for ii in cdata]
+
+        for i_obs,obsname in enumerate(sample_names):
+            if not i_obs in i_plots:continue
+            ccfrv = CCFRV[i_obs]
+            yoffset = 0#ccfrv
+            date_obs = neid_dict[obsname]['DATE-OBS']
+            date = date_obs[5:10]
+            time = date_obs[11:16]
+
+            err = weights[i_obs]**(-0.5)
+            snr = spec_raw[i_obs]/err
+            text = "%.2f $v_{CCF}$:%.2f m/s $\chi^2=%.2f$"%(neid_dict[obsname]['timestamp'],ccfrv,fit_chi[i_obs])
+            print(text,obsname)
+            
+            ax.plot(wave_raw[i_obs],spec_raw[i_obs],drawstyle="steps-mid",alpha=1.0,lw=1,c=colors[i_obs],label=text)
+            ax.fill_between(wave_raw[i_obs],spec_raw[i_obs]-err,spec_raw[i_obs]+err,color=colors[i_obs],alpha=0.2,step="mid")
+            ax.set_xlabel("Raw wavelength ($\AA$)")
+            ax.set_ylabel("normalized flux")
+            ax.legend(loc="lower left",ncols=2)
+            ax.set_title("Order %d"%(order),color=title_color)
+        ax.set_ylim(0,spec_raw[i_obs].max())
+        ax=axs[1][0]
         ax.scatter(NEID_JD,NEID_CCFRV,c="grey",s=5,label="all (N=%d)"%len(NEID_JD))
         img = ax.scatter(NEID_JD[SELECT],NEID_CCFRV[SELECT],s=5,label="selected (N=%d)"%len(SELECT))
         ax.legend(loc="upper left")
         ax.set_xlabel("JD")
         ax.set_ylabel("NEID Solar RV [km/s]")
-        ax=axs[0][1]
+        ax=axs[1][1]
         ax.scatter(timestamp,v_template,c='orange',s=3,
                    label="$v_{template}$ RMS = %.2f m/s"%(v_template.std()))
         ax.scatter(timestamp,CCFRV,c='grey',s=2,label="$v_{CCF,NEID}$ RMS = %.2f m/s"%(CCFRV.std()))
@@ -1856,15 +1910,17 @@ for i,order in enumerate(ORDERS):
         ax.legend(title="Discrepancy RMS = %.2f m/s"%(v_template-CCFRV).std())
         ax.set_xlabel("JD")
         ax.set_ylabel("RV [m/s]")
-        ax=axs[1][0]
+        ax=axs[1][2]
         ax.scatter(timestamp,fit_chi,c='orange',s=3)
         ax.set_xlabel("JD")
         ax.set_ylabel("$\chi^2_r$")
-        ax=axs[1][1]
-        ax.scatter(timestamp,water_vapor,c='b',s=3)
+
+        ax.scatter(timestamp,1.5*water_vapor/water_vapor.max(),
+                   label="Water Vapor",
+                   c='b',s=3)
         ax.set_xlabel("JD")
-        ax.set_ylabel("Water Vapor")
-        ax=axs[0][2]
+        #ax.set_ylabel("Water Vapor")
+        ax=axs[1][3]
         for i in range(100):
             ax.plot(wave_mean,wave_raw[i]-wave_mean,c='k',lw=1,alpha=0.5)
         ax.plot(wave_mean,wave_std,c='r',lw=2)

@@ -266,6 +266,43 @@ def plot_diagnostic(diags,model,instrument,ratio=50,n_window=2):
     from scipy.ndimage import gaussian_filter1d
     from astropy.timeseries import LombScargle
     from util import moving_mean
+    
+    tlin = torch.linspace(200,1500,2000,device=instrument.wave_obs.device)
+    #v_spline = model.doppler_model(tlin[:,None],ph_shift=0.25)
+    v_spline = model.estimate_doppler_rv(tlin[:,None])
+    periods = model.doppler_model.get_periods()
+
+    quasi_terms = model.doppler_model.get_quasi_periodic_terms(tlin[:,None])
+    quasi_terms = tensor2array(quasi_terms)
+    print("quasi_terms:",quasi_terms.shape)
+
+    tlin = tensor2array(tlin)
+    periods = tensor2array(periods)
+    v_spline = tensor2array(v_spline)
+
+    fig,ax=plt.subplots(figsize=(12,0.5*len(periods)+2),constrained_layout=True)
+    ampl = v_spline.std(axis=1)
+    rank = np.argsort(periods)
+
+    for i_rank in range(len(periods)):
+        i = rank[i_rank]
+        p = periods[i]
+        v_spline[i]-=np.mean(v_spline[i])
+        s2 = sinusoidality_harmonic(tlin, v_spline[i], np.ones_like(v_spline[i]), p)
+        var1,var2 = quasi_terms[i].max(axis=0)-quasi_terms[i].min(axis=0)
+        phase_avg = quasi_terms[i,:,1].mean()
+        label = f"P={p:.2f}d  var=[{var1:.2f},{var2:.2f}]  S={s2:.2f}"
+        #print(label,"phi_coeff:",model.doppler_model.phi_coef[i])
+        #print("amp_coeff:",model.doppler_model.amp_coef[i])
+
+        y_off = (i_rank+1)*0.5
+        line,=ax.plot(tlin,v_spline[i]+y_off,"-",label=label)
+        #line,=ax.plot(tlin,quasi_terms[i,:,1]+y_off,"-",label=label)
+        ax.text(-200,y_off,label,color = line.get_color())
+        ax.set_yticks([])
+    #ax.legend()
+    ax.set_xlim(tlin.min(),tlin.max())
+    plt.savefig("vspline.png",dpi=200)
     if not "input_data" in diags:
         time,v_trad,v_encode,v_planet = [tensor2array(item[:,0]) for item in diags["rv"]]
         print(f"v_encode: {v_encode.std():.3f} m/s")
@@ -278,6 +315,7 @@ def plot_diagnostic(diags,model,instrument,ratio=50,n_window=2):
         ax.legend()
         plt.savefig("test.png",dpi=200)
         exit()
+
     if "rv" in diags:
         time,v_trad,v_encode,v_planet,v_act,v_doppler = [tensor2array(item[:,0]) for item in diags["rv"]]
 
@@ -286,42 +324,6 @@ def plot_diagnostic(diags,model,instrument,ratio=50,n_window=2):
         v_aestra -= v_aestra.mean()
         print("v_doppler:",v_doppler.shape)
         
-        tlin = torch.linspace(200,1500,2000,device=instrument.wave_obs.device)
-        v_spline,v_trend = model.estimate_doppler_rv(tlin[:,None])
-        periods = model.doppler_model.get_periods()
-
-        quasi_terms = model.doppler_model.get_quasi_periodic_terms(tlin[:,None])
-        quasi_terms = tensor2array(quasi_terms)
-        print("quasi_terms:",quasi_terms.shape)
-        
-        tlin = tensor2array(tlin)
-        periods = tensor2array(periods)
-        v_spline = tensor2array(v_spline)
-        v_trend = tensor2array(v_trend)
-        fig,ax=plt.subplots(figsize=(12,0.5*len(periods)+2),constrained_layout=True)
-        ampl = v_spline.std(axis=1)
-        rank = np.argsort(periods)
-        ax.plot(tlin,v_trend-v_trend.mean(),"k-",lw=2)
-        for i_rank in range(len(periods)):
-            i = rank[i_rank]
-            p = periods[i]
-            v_spline[i]-=np.mean(v_spline[i])
-            s2 = sinusoidality_harmonic(tlin, v_spline[i], np.ones_like(v_spline[i]), p)
-            var1,var2 = quasi_terms[i].max(axis=0)-quasi_terms[i].min(axis=0)
-            phase_avg = quasi_terms[i,:,1].mean()
-            label = f"P={p:.2f}d  var=[{var1:.2f},{var2:.2f}]  S={s2:.2f}"
-            #print(label,"phi_coeff:",model.doppler_model.phi_coef[i])
-            #print("amp_coeff:",model.doppler_model.amp_coef[i])
-
-            y_off = (i_rank+1)*0.5
-            line,=ax.plot(tlin,v_spline[i]+y_off,"-",label=label)
-            #line,=ax.plot(tlin,quasi_terms[i,:,1]+y_off,"-",label=label)
-            ax.text(-200,y_off,label,color = line.get_color())
-            ax.set_yticks([])
-        #ax.legend()
-        ax.set_xlim(tlin.min(),tlin.max())
-        plt.savefig("vspline.png",dpi=200)
-
         ind = np.argsort(time)
         frequency = 1.0/np.logspace(0.2, 2.6, 10000)
         power = LombScargle(time[ind], v_encode[ind]).power(frequency)
@@ -385,6 +387,12 @@ def plot_diagnostic(diags,model,instrument,ratio=50,n_window=2):
 
     loss = w*(spec_zero_rv-model_resid)**2
     loss_ind = np.sum(loss, axis=-1) / np.sum(w>1,axis=-1)
+    
+    plt.clf()
+    plt.hist(loss_ind,bins=20)
+    plt.axvline(loss_ind.mean(axis=0),color="k",ls="--")
+    plt.savefig("loss.png",dpi=200)
+    plt.clf()
 
     loss_avg = gaussian_filter1d(loss.mean(axis=0),2)
     loss_avg -= np.quantile(loss_avg,0.3)
@@ -392,6 +400,7 @@ def plot_diagnostic(diags,model,instrument,ratio=50,n_window=2):
 
     print("masked:",(w<=1).sum()/(n_batch*n_spec))
     print("loss:",loss_ind.shape,loss_ind.mean())
+    
 
     diag = np.copy(loss_ind)
     #diag_full = loss
@@ -414,7 +423,7 @@ def plot_diagnostic(diags,model,instrument,ratio=50,n_window=2):
     c_order = "k"
     err_c = "lightgrey"
     zorder = 0
-    window = 1.5
+    window = 2.5
     #colors = ["k","b","darkgreen"]*n_order
     #c_err = ["lightgrey","lavender","palegreen"]*n_order
     fig,axs=plt.subplots(figsize=(12,7),ncols=ncols,nrows=2,
@@ -465,8 +474,9 @@ def plot_diagnostic(diags,model,instrument,ratio=50,n_window=2):
         #ax.set_ylim(ylim)
         for i_row in range(2):
             ax = axs[i_row]#[k]
-            xlim = [wave_obs[wh]-window,wave_obs[wh]+window]
+            #xlim = [wave_obs[wh]-window,wave_obs[wh]+window]
             #xlim = [wave_obs[-1]-3,wave_obs[-1]+0.1]
+            xlim = [4957,4961]
             ax.set_xlim(xlim);
             ax.legend()
 
@@ -476,7 +486,6 @@ def plot_diagnostic(diags,model,instrument,ratio=50,n_window=2):
 
 def print_planet_solutions(p0,p,current_Ks,periods,
                            n_string=10,corr=None):
-    current_Ks = current_Ks[current_Ks>0]
     rank = torch.argsort(current_Ks,descending=True)
     for i in rank:
         K0,P0 = p0[i,:2]
@@ -488,7 +497,7 @@ def print_planet_solutions(p0,p,current_Ks,periods,
         str1 += f"K={K0:.3f}m/s"
         str2 = f"{P:.4f}d"
         str2 += " "*(n_string-len(str2))
-        str2 += f"K={K.abs():.3f}m/s"
+        str2 += f"K={K:.3f}m/s"
         if corr is None: str3 = ""
         else: str3 = f"  corr: {corr[i]:.3f}"
         print(str1," --> ",str2,str3)
@@ -496,6 +505,13 @@ def print_planet_solutions(p0,p,current_Ks,periods,
 
 def hinge_loss_penalty(x, x0=14.35, dx=0.15):
     return torch.maximum(torch.zeros_like(x), dx - torch.abs(x - x0))/dx
+
+def doppler_correlation(jd,vel,v_doppler,t_seg=800):
+    m1 = jd.squeeze(1)<t_seg
+    m2 = jd.squeeze(1)>t_seg
+    corr1 = pearson_corrcoef_batch(vel[m1].squeeze(1),v_doppler[:,m1])
+    corr2 = pearson_corrcoef_batch(vel[m2].squeeze(1),v_doppler[:,m2])
+    return corr1,corr2
 
 def get_losses(model,
                instrument,
@@ -524,7 +540,8 @@ def get_losses(model,
     fid_loss = sim_loss = flex_loss = cons_loss = 0
 
     ccf_info,spec_raw,w,ssbrv,jd = batch
-    v_trad = ccf_info[:,[0]]
+    #v_trad = ccf_info[:,[0]]
+    v_trad = ccf_info[:,[1]]
 
     print("v_trad:",v_trad.shape)
 
@@ -567,12 +584,17 @@ def get_losses(model,
         flex_loss = torch.log(rv_err**2).sum()
 
     else:
-        # replace rv estimator with v_nn
+        # replace rv estimator with pre-trained values
         indices = torch.searchsorted(aux_data[0].contiguous(), jd)
         v_apparent = aux_data[1][indices]
         v_offset = aux_data[2][indices]
         quality_mask = aux_data[3][indices][:,0].bool()
-
+        # replace auto encoder with pre-trained values
+        start,end = 5,len(aux_data)
+        s_load = [aux_data[ii][indices] for ii in range(start,end)]
+        s_load = torch.cat(s_load,dim=1)
+        #s = s_load
+        #stellar_activity = False
         print("quality_mask:",quality_mask.sum())
         #rv = v_nn
         print(f"[Pretrained RV] Apparent vs. Trad Difference: {(v_apparent-v_trad-v_planet).std():.3f} m/s")
@@ -590,13 +612,19 @@ def get_losses(model,
         model_resid = spectrum_observed-template
         model_resid[w<1.0] = 0
 
-        print("s:",s.std(dim=0))
         print("y_act:",y_act.std(dim=0).mean())
 
         # compare residual model
         loss = model._loss(spec_zero_rv, w, model_resid, individual=True)
-        print("loss:",loss.shape,loss.mean())
+        
         fid_loss = 2*loss[quality_mask].sum()
+        print("loss:",loss.shape,fid_loss.item()/batch_size)
+        if fid_loss.item()/batch_size < 0.7:
+            print("\n\nfidelity_loss<0.7!",fid_loss.item()/batch_size)
+            print("loss:",loss.min().item(),loss.max().item())
+            print("quality_mask:",quality_mask.sum(),
+                   quality_mask.shape)
+            args.debug=True
     else: pass
 
     if flexibility:
@@ -606,53 +634,58 @@ def get_losses(model,
         sim_loss = similarity_restframe(model, y_act, s, slope=slope,sigma_s=sigma_s)
 
     #if regularize_v:
-
-    if (consistency and (fid_loss/batch_size < 0.94)) or (stellar_activity and args.debug):
+    if (consistency and (fid_loss/batch_size < 0.96)) or (stellar_activity and args.debug):
         #    s_aug = model.encode(spec_input_aug)
         #    cons_loss = consistency_loss(s, s_aug
         v_act = model.activity_estimator(s)
-        v_doppler,v_trend = model.estimate_doppler_rv(jd)
+        v_doppler = model.estimate_doppler_rv(jd)
         #v_doppler = model.activity_estimator.doppler_rv(jd)
 
         v_doppler_sum = v_doppler.sum(dim=0)[:,None]
 
-        print(f"v_trend: {v_trend.min():.3f} m/s  {v_trend.max():.3f} m/s")
-
-        #v_resid = rv-v_trend.unsqueeze(1)
-        v_resid = v_apparent-v_offset-v_act-v_doppler_sum
-        v_reg_loss = 2e-2*torch.sum((v_resid[quality_mask])**2)
+        #quality_mask = jd>500
+        v_resid = v_apparent-v_act-v_doppler_sum-v_offset
+        v_reg_loss = 0.05*torch.sum((v_resid[quality_mask])**2)
         print("v_reg_loss:",v_reg_loss.item()/batch_size)
 
-        doppler_corr = pearson_corrcoef_batch(v_act.T,v_doppler)
-        #print("doppler_corr:",doppler_corr.shape)
-        #cons_loss += slope*doppler_corr.abs().mean()
-        #print("cons_loss:",cons_loss.item()/batch_size)
-        #rank = torch.argsort(K.abs(),descending=True)
-        #x = torch.arange(len(K),device=K.device)
-        #x = torch.sigmoid(x-5)
+        v_shifted = model.doppler_model(jd,ph_shift=0.25)
 
-        #K_reg_loss = 1e-2*slope*K.abs()
-        #hloss = hinge_loss_penalty(Period)*K.abs()
-        #cons_loss += K_reg_loss.sum()*batch_size
-        #current_Ks = 0.5*(v_doppler.max(dim=-1)[0]-v_doppler.min(dim=-1)[0])
+        model_params = model.doppler_model.planet_params
+        current_Ks = model_params[:,0]
+        periods = model.doppler_model.get_periods()
+        
+        corr = doppler_correlation(jd,v_act,v_doppler)
+        anti_corr = doppler_correlation(jd,v_act,v_shifted)
+        
+        doppler_corr = (corr[1]-corr[0])**2
+        # weaker constraints for long periods
+        doppler_corr[periods>200] *= 0.0
+        #doppler_corr += (corr1-corr2)**2
+        print("periods:",periods)
+        print("doppler_corr:",doppler_corr.shape)
 
+        cons_loss = batch_size*0.05*torch.sum(doppler_corr)
+        print("cons_loss:",cons_loss.item()/batch_size)
+
+        if v_resid.std().item()>0.4:cons_loss=0
+        if v_resid.std().item()<0.1:cons_loss=0
         #K_reg_loss = slope*torch.exp(-current_Ks[(current_Ks>0.1)])
         #cons_loss += K_reg_loss.sum()
         #print("K_reg_loss:",K_reg_loss.sum()/batch_size)
 
         print(f"v_act RMS:{v_act.std():.5f} m/s")
         print(f"v_doppler RMS:{v_doppler_sum.std():.3f} m/s")
-        print(f"v_trend RMS:{v_trend.std():.3f} m/s")
+        print(f"v_offset RMS:{v_offset.std():.3f} m/s")
         print(f"Initial RMS:{rv[quality_mask].std().item():.3f} m/s")
         print(f"Residual RMS:{(v_resid[quality_mask]).std().item():.3f} m/s")
 
         s_corr = pearson_corrcoef_batch(rv.T,s.T)
         print("s_i correlation with v_apparent:",s_corr.detach())
 
-        spline_params = model.doppler_model.planet_params
-        current_Ks = 0.5*(v_doppler.max(dim=-1)[0]-v_doppler.min(dim=-1)[0])
+
+        #0.5*(v_doppler.max(dim=-1)[0]-v_doppler.min(dim=-1)[0])
         print_planet_solutions(planet_params,
-                               spline_params,
+                               model_params,
                                current_Ks,
                                model.doppler_model.get_periods(),
                                corr=doppler_corr)
@@ -685,7 +718,7 @@ def get_losses(model,
                                                            slope=slope,sigma_s=sigma_s,individual=True)
             plot_similarity(s_sim,spec_sim,sim_loss,sigma_s=sigma_s,slope=slope)
         plot_diagnostic(diags,model,instrument)
-        #exit()
+        exit()
     return fid_loss, sim_loss, z_loss, cons_loss, v_reg_loss, flex_loss
 
 
@@ -731,14 +764,19 @@ def load_model(mainfile, models, instruments, new_act = False):
             if not "activity_estimator" in k and not "doppler_model" in k:
                 filtered[k] = v
                 continue
-            if new_act:continue
+
             if  k in init_dict:
                 shape1 = model_dict[k].shape
                 shape2 = init_dict[k].shape
                 if shape1==shape2:
                     filtered[k] = v
                     continue
-                else:new_act = True
+                else:
+                    # shape mismatch -- load to the first entry
+                    filtered[k] = init_dict[k]
+                    #filtered[k][0] = v
+                    print(k,v.shape,init_dict[k].shape)
+                    new_act = True
             else:new_act = True
 
         model.load_state_dict(filtered, strict=False)
@@ -791,16 +829,16 @@ def log_cuda_info(device,cuda_log_path="cuda_info.log", smi_log_path="nvidia_smi
         print(f"Failed to run nvidia-smi: {e}")
     return
 
+def filter_unique_periods(all_periods,basefrac=0.02):
+    uniq_periods = np.zeros_like(all_periods)
+    for i,P in enumerate(all_periods):
+        if P>100:frac = 0.3
+        else:frac = basefrac 
 
-def unique_within_tol(arr, tol=0.05):
-    arr = np.asarray(arr)
-    idx = np.argsort(arr)
-    sorted_arr = arr[idx] + 1e-6
-
-    keep = np.r_[True, np.diff(sorted_arr)/sorted_arr[:-1] > tol]
-    mask = np.zeros_like(keep)
-    mask[idx] = keep
-    return mask
+        if np.abs(uniq_periods/P-1).min()<frac:continue
+        else:uniq_periods[i]=P
+    print("uniq_periods:",uniq_periods)
+    return uniq_periods>0
 
 def train(models,
           instruments,
@@ -978,7 +1016,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("data", help="dataset name")
     parser.add_argument("outfile", help="output file name")
-    parser.add_argument("-dir","--dir", help="data file directory", default="/scratch/gpfs/yanliang/neid-production/")
+    parser.add_argument("-dir","--dir", help="data file directory", default="/scratch/gpfs/JNWINN/yanliang/neid-production/")
     parser.add_argument("-n", "--latents", help="latent dimensionality", type=int, default=2)
     parser.add_argument("-b", "--batch_size", help="batch size", type=int, default=512)
     parser.add_argument("-l", "--batch_number", help="number of batches per epoch", type=int, default=None)
@@ -1005,7 +1043,7 @@ if __name__ == "__main__":
     parser.add_argument("-shuffle", "--shuffle", help="shuffle inputs", action="store_true")
     args = parser.parse_args()
     
-    if args.debug:torch.cuda.set_device('cuda:1')
+    if args.debug:torch.cuda.set_device('cuda:3')
     print("args.outfile:",args.outfile)
     basename = os.path.basename(args.outfile)
     basename = "_".join(basename.split("_")[:-1])
@@ -1013,12 +1051,23 @@ if __name__ == "__main__":
         seed_file = f"initial_guess/{basename}_{args.planet_seed}.txt"
         print(f"Loading from {seed_file}...")
         planet_params = np.loadtxt(seed_file)
-        
-        min_K = 0.05 # m/s
+        #print("planet_params:",planet_params)
+        min_K = 0.1 # m/s
+        #planet_params[:,0] *= 0.8
         # reject repetitive entries
         mask = planet_params[:,0]>min_K
-        mask &= unique_within_tol(planet_params[:,1])
+        mask &= filter_unique_periods(planet_params[:,1], basefrac=0.05)#baselinefrac=0.15
         planet_params = planet_params[mask]
+        
+        #rank = np.argsort(planet_params[:,1])
+        #planet_params = planet_params[rank]
+        #planet_params = planet_params[1::2]
+        #mask &= planet_params[:,1]<300
+        #mask &= np.abs(planet_params[:,1]-3.16)<0.1
+        #planet_params[:,0] = 0.3
+        if not args.consistency:
+            planet_params = np.zeros((2,3))
+        
     else:
         planet_params = np.zeros((2,3))
 
@@ -1029,7 +1078,10 @@ if __name__ == "__main__":
     models = []
 
     if args.skipz:
-        aux_data = correct_velocity_offset(f"{args.dir}/aux/{basename}_v_apparent.pkl")
+        aux_data = correct_velocity_offset(f"{args.dir}/aux/{basename}_v_apparent_full.pkl")
+        latents = torch.load(f"{args.dir}/aux/trad_latents.pkl")
+        aux_data = torch.cat([aux_data,latents])
+
     else: aux_data = torch.zeros((1,4))
     
     template_data = load_batch("%s/merge/%s-template.pkl"%(args.dir,args.data))
@@ -1067,8 +1119,8 @@ if __name__ == "__main__":
     planet_param = [args.amp,args.period,args.phase]
 
     # define training sequence
-    FULL = {"data":[True,True],"encoder":[True,True],"rv":[True,True],
-            "decoder":True,"spec_rest":True,
+    FULL = {"data":[True],"encoder":[True],"rv":[True],
+            "decoder":True,"spec_rest":False,
             "telluric":args.telluric, "fringe":args.fringe}
     train_sequence = prepare_train([FULL],niter=args.iteration)
 

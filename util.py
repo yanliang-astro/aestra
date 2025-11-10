@@ -49,7 +49,7 @@ def evaluate_cubic(x_in, coefficients, x_ref):
     return y_eval
 
 def load_master_fsr_mask():
-    filename = "/scratch/gpfs/yanliang/headers/neidMaster_FSR_Mask20210218_v002.fits"
+    filename = "/scratch/gpfs/JNWINN/yanliang/neid_headers/neidMaster_FSR_Mask20210218_v002.fits"
     hdulist = fits.open(filename)
     header = hdulist[0].header
     fsr_mask = hdulist[0].data
@@ -128,6 +128,7 @@ def interpolate_to_input_grid(batch,instrument,template_input,aug=False,extra_rv
 
     # produce augmentation data -- inject rv offset
     if aug:
+        #z_lim = 5e-9 # 1.5 m/s
         z_lim = 1e-8 # 3 m/s
         z_offset = z_lim*(torch.rand(n_batch,1, device=device)-0.5)
     else: z_offset = torch.zeros(n_batch,1, device=device)
@@ -166,16 +167,16 @@ def interpolate_to_input_grid(batch,instrument,template_input,aug=False,extra_rv
     spec_input = (spectrum - template).float()
     weight[bad] = 1e-12
     spec_input[bad] = 0.0
-    gaussian_kernel = gaussian_kernel_1d(sigma=1, device=spectrum.device)
-
+    #gaussian_kernel = gaussian_kernel_1d(sigma=1, device=spectrum.device)
     # Apply 1D convolution
-    spec_input = F.conv1d(spec_input.unsqueeze(1), gaussian_kernel, padding=1).squeeze(1)  # Padding to keep the output size the same
+    #spec_input = F.conv1d(spec_input.unsqueeze(1), gaussian_kernel, padding=1).squeeze(1)  # Padding to keep the output size the same
 
     return spec_input, weight.float(), z_offset
 
 
 def interpolate_to_input_grid_raw(batch,instrument,template_raw,extra_rv=0.,polyb=0.):
     wave_raw,spec_raw,w_raw,ssbrv,jd = batch
+    w_raw[torch.isnan(w_raw)] = 1e-12
 
     n_batch,n_spec = spec_raw.shape
     wave_obs = instrument.wave_obs
@@ -302,6 +303,7 @@ def load_model(path, instrument, device):
     spec_rest = model_dict['decoder.spec_rest']
 
     n_pl,n_param=model_dict['doppler_model.planet_params'].shape
+    n_param=3
     print("n_pl,n_param:",n_pl,n_param)
 
     if 'encoder.mlp.mlp.9.bias' in model_dict:
@@ -321,8 +323,9 @@ def load_model(path, instrument, device):
     model.eval()
     return model,mdict["losses"],n_latent
 
-def simulate_planet(t,amp=1,period=0.11,phase_t0=0):
-    phase = ((t/period)-phase_t0)%1
+def simulate_planet(t,amp=1,period=0.11,phase_t0=0, t0=800):
+    #phase = ((t/period)-phase_t0)%1
+    phase = (((t-t0)/period)+phase_t0)%1
     v_planet = amp*torch.sin(2*np.pi*phase)#[:,None]
     return phase,v_planet
 

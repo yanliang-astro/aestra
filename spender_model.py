@@ -5,6 +5,7 @@ from torchinterp1d import Interp1d
 from torchcubicspline import natural_cubic_spline_coeffs
 from periodic_spline_model import PeriodicSplineRV
 import torch.nn.functional as F
+from einops import rearrange
 
 # Define a 1D Gaussian kernel with standard deviation sigma
 def gaussian_kernel_1d(sigma = 20,kernel_size=51, device=None):
@@ -107,8 +108,8 @@ class ActivityEstimator(nn.Module):
                  n_in,
                  n_out=1,
                  n_channel=1,
-                 n_hidden=(2,),
-                 act=(nn.PReLU(), nn.Identity()),
+                 n_hidden=(8,),
+                 act=(nn.PReLU(),nn.PReLU(), nn.Identity()),
                  dropout=0):
         super(ActivityEstimator, self).__init__()
 
@@ -157,40 +158,64 @@ class SpeculatorActivation(nn.Module):
 class RVEstimator(nn.Module):
     def __init__(self,
                  input_shape,
-                 sizes = [5,10],
+                 sizes = [11,321],
                  n_hidden=(128, 64, 32),
                  act=(nn.PReLU(128),nn.PReLU(64),nn.PReLU(32), nn.PReLU()),
-                 dropout=0):
+                 dropout=0,
+                 strides=(1,1)):
         super(RVEstimator, self).__init__()
+        n_order, n_in = input_shape
+        assert n_order == 1
 
-        if len(input_shape)==2:
-            n_order,n_in = input_shape
-        else:
-            n_order=1
-            n_in = input_shape[0]
+        # fold 1d data into 2d shape (B, kfold, L)
+        self.kfold = 1
+        self.L = (n_in + self.kfold - 1) // self.kfold
 
-        filters = [n_order,128,64]
-        self.conv1,self.conv2 = self._conv_blocks(filters, sizes, dropout=dropout)
-        self.n_feature = filters[-1] * ((n_in //sizes[0])//sizes[1])
-
+        filters = [self.kfold, 128, 64]
+        self.conv1, self.conv2 = self._conv_blocks(filters, sizes, strides, dropout=dropout)
         self.pool1, self.pool2 = tuple(nn.MaxPool1d(s) for s in sizes[:2])
-        print("self.n_feature:",self.n_feature)
+
+        # --- NEW: infer n_feature by probing the stack (handles any stride/size/padding) ---
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.kfold, self.L)
+            x = self.pool1(self.conv1(dummy))
+            x = self.pool2(self.conv2(x))
+            x = nn.Softmax(dim=-1)(x)
+            x = nn.Flatten()(x)
+            self.n_feature = x.shape[-1]
+        print("self.n_feature:", self.n_feature)
+
         self.mlp = MLP(self.n_feature, 2, n_hidden=n_hidden, act=act, dropout=dropout)
         self.flatten = nn.Flatten()
         self.softmax = nn.Softmax(dim=-1)
+        
+    def fold_1d(self,x):
+        """
+        Reshape input (B, C, L) into (B, C*k, L//k) by folding the length axis.
+        Zero-pads L to make it divisible by k.
+        """
+        B, C, L = x.shape
+        pad_len = (-L) % self.kfold   # how many to pad on the right
+        if pad_len > 0:
+            x = F.pad(x, (0, pad_len))  # pad along last axis
+        L_new = x.shape[-1]
+        # reshape: split length into (L//k, k), then move k into channel dimension
+        x = rearrange(x, 'b c (l k) -> b (c k) l', k=self.kfold)
+        return x
 
-    def _conv_blocks(self, filters, sizes, dropout=0):
+    def _conv_blocks(self, filters, sizes, strides, dropout=0):
         convs = []
-        for i in range(1,len(filters)):
+        for i in range(1, len(filters)):
             f_in = filters[i-1]
             f = filters[i]
-            s = sizes[i-1]
-            p = s // 2
+            k = sizes[i-1]
+            s = strides[i-1] if isinstance(strides, (list, tuple)) else 1   # <-- uses stride
+            p = k // 2
             conv = nn.Conv1d(in_channels=f_in,
                              out_channels=f,
-                             kernel_size=s,
-                             padding=p,
-                            )
+                             kernel_size=k,
+                             stride=s,               # <-- minimal change here
+                             padding=p)
             norm = nn.InstanceNorm1d(f)
             act = nn.PReLU(num_parameters=f)
             drop = nn.Dropout(p=dropout)
@@ -199,6 +224,8 @@ class RVEstimator(nn.Module):
 
     def forward(self, x):
         if x.ndim==2:x = x.unsqueeze(1)
+        # fold 1d spectrum into channels 
+        x = self.fold_1d(x)
         # compression
         x = self.pool1(self.conv1(x))
         x = self.pool2(self.conv2(x))
@@ -300,7 +327,7 @@ class StablePolynomialBackground(nn.Module):
         coeffs -= coeffs.mean()
         # Use small initial values for stability
         self.raw_coeffs = nn.Parameter(coeffs)  # start from 0
-        self.coeff_scale = 1e-7  # scale factor to keep coefficients small
+        self.coeff_scale = 1e-8  # scale factor to keep coefficients small
 
     def spline(self, x, values):
         """
@@ -708,7 +735,7 @@ class SpectrumAutoencoder(BaseAutoencoder):
 
         if rv_estimator==None:
             #rv_estimator = NullRVEstimator()
-            rv_estimator = RVEstimator(instrument.wave_obs.shape,sizes = [20,80])
+            rv_estimator = RVEstimator(instrument.wave_obs.shape)
 
         if skip_encoding:
             encoder = None
