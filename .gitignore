@@ -1,0 +1,6 @@
+# demo data: attached to the GitHub release, not committed
+demo/
+*.tar.gz
+# Python and Jupyter caches
+__pycache__/
+.ipynb_checkpoints/
